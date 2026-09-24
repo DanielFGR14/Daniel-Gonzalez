@@ -1,0 +1,102 @@
+name: Agente de comentarios de YouTube
+
+on:
+  schedule:
+    # 02:05 UTC = 9:05 p. m. en Colombia (UTC-5, sin horario de verano). Unos minutos después
+    # de la hora en punto porque GitHub avisa que a la hora exacta puede retrasar o descartar trabajos.
+    - cron: "5 2 * * *"
+  workflow_dispatch:
+    inputs:
+      command:
+        description: "draft = preparar borradores para aprobar, train = volver a aprender tu estilo"
+        type: choice
+        options: [draft, train]
+        default: draft
+  # Cuando cierras un issue de borradores, se publica lo que aprobaste.
+  issues:
+    types: [closed]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  agent:
+    # Un issue cerrado solo cuenta si lo creó el agente y lo cerraste tú (el dueño del repo).
+    if: >-
+      github.event_name != 'issues' || (
+        contains(github.event.issue.labels.*.name, 'respuestas-por-aprobar') &&
+        github.event.issue.user.login == 'github-actions[bot]' &&
+        github.event.sender.login == github.repository_owner)
+    runs-on: ubuntu-latest
+    # Las pausas entre respuestas hacen que publicar tarde hasta MAX_RUN_MINUTES (60 por defecto).
+    timeout-minutes: 90
+    concurrency:
+      group: youtube-comment-agent
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: youtube-comment-agent
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: youtube-comment-agent/requirements.txt
+
+      - run: pip install -r requirements.txt
+
+      # El entrenamiento, los borradores y el registro de lo publicado se guardan entre ejecuciones.
+      - uses: actions/cache/restore@v4
+        with:
+          path: youtube-comment-agent/data
+          key: yt-agent-data-${{ github.run_id }}
+          restore-keys: yt-agent-data-
+
+      - name: Ejecutar agente
+        env:
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          # Lista de miembros (IDs "UC..." o @handles) como secreto, para que no quede pública.
+          MEMBER_CHANNEL_IDS: ${{ secrets.MEMBER_CHANNEL_IDS }}
+          GITHUB_TOKEN: ${{ github.token }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
+          LOOKBACK_DAYS: ${{ vars.LOOKBACK_DAYS }}
+          MAX_MEMBER_REPLIES: ${{ vars.MAX_MEMBER_REPLIES }}
+          MAX_SUBSCRIBER_REPLIES: ${{ vars.MAX_SUBSCRIBER_REPLIES }}
+          MAX_REPLIES_PER_AUTHOR: ${{ vars.MAX_REPLIES_PER_AUTHOR }}
+          INCLUDE_NON_SUBSCRIBERS: ${{ vars.INCLUDE_NON_SUBSCRIBERS }}
+          VARIANTS_PER_COMMENT: ${{ vars.VARIANTS_PER_COMMENT }}
+          MAX_SIMILARITY: ${{ vars.MAX_SIMILARITY }}
+          MIN_STYLE_SCORE: ${{ vars.MIN_STYLE_SCORE }}
+          MIN_DELAY_SECONDS: ${{ vars.MIN_DELAY_SECONDS }}
+          MAX_DELAY_SECONDS: ${{ vars.MAX_DELAY_SECONDS }}
+          MAX_RUN_MINUTES: ${{ vars.MAX_RUN_MINUTES }}
+          TRAIN_BEFORE: ${{ vars.TRAIN_BEFORE }}
+          EVENT_NAME: ${{ github.event_name }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          COMMAND: ${{ inputs.command || 'draft' }}
+        run: |
+          if [ "$EVENT_NAME" = "issues" ]; then
+            python -m agent publish --issue "$ISSUE_NUMBER"
+          else
+            python -m agent "$COMMAND"
+          fi
+
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: youtube-comment-agent/data
+          key: yt-agent-data-${{ github.run_id }}
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reporte-${{ github.run_id }}
+          path: youtube-comment-agent/reports/
+          retention-days: 7
+          if-no-files-found: ignore
