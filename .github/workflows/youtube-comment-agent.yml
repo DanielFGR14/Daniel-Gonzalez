@@ -8,28 +8,32 @@ on:
   workflow_dispatch:
     inputs:
       command:
-        description: "run = responder, train = volver a aprender tu estilo"
+        description: "draft = preparar borradores para aprobar, train = volver a aprender tu estilo"
         type: choice
-        options: [run, train]
-        default: run
-      dry_run:
-        description: "Simular sin publicar (default = usa la variable DRY_RUN del repo)"
-        type: choice
-        options: [default, "true", "false"]
-        default: default
-
-concurrency:
-  group: youtube-comment-agent
-  cancel-in-progress: false
+        options: [draft, train]
+        default: draft
+  # Cuando cierras un issue de borradores, se publica lo que aprobaste.
+  issues:
+    types: [closed]
 
 permissions:
   contents: read
+  issues: write
 
 jobs:
   agent:
+    # Un issue cerrado solo cuenta si lo creó el agente y lo cerraste tú (el dueño del repo).
+    if: >-
+      github.event_name != 'issues' || (
+        contains(github.event.issue.labels.*.name, 'respuestas-por-aprobar') &&
+        github.event.issue.user.login == 'github-actions[bot]' &&
+        github.event.sender.login == github.repository_owner)
     runs-on: ubuntu-latest
-    # Las pausas entre respuestas hacen que tarde hasta MAX_RUN_MINUTES (60 por defecto).
+    # Las pausas entre respuestas hacen que publicar tarde hasta MAX_RUN_MINUTES (60 por defecto).
     timeout-minutes: 90
+    concurrency:
+      group: youtube-comment-agent
+      cancel-in-progress: false
     defaults:
       run:
         working-directory: youtube-comment-agent
@@ -44,7 +48,7 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      # El entrenamiento y el registro de respuestas publicadas se guardan entre ejecuciones.
+      # El entrenamiento, los borradores y el registro de lo publicado se guardan entre ejecuciones.
       - uses: actions/cache/restore@v4
         with:
           path: youtube-comment-agent/data
@@ -59,8 +63,7 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           # Lista de miembros (IDs "UC..." o @handles) como secreto, para que no quede pública.
           MEMBER_CHANNEL_IDS: ${{ secrets.MEMBER_CHANNEL_IDS }}
-          # Mientras no crees la variable DRY_RUN=false, solo simula.
-          DRY_RUN: ${{ (inputs.dry_run == 'true' || inputs.dry_run == 'false') && inputs.dry_run || vars.DRY_RUN || 'true' }}
+          GITHUB_TOKEN: ${{ github.token }}
           OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
           LOOKBACK_DAYS: ${{ vars.LOOKBACK_DAYS }}
           MAX_MEMBER_REPLIES: ${{ vars.MAX_MEMBER_REPLIES }}
@@ -74,7 +77,15 @@ jobs:
           MAX_DELAY_SECONDS: ${{ vars.MAX_DELAY_SECONDS }}
           MAX_RUN_MINUTES: ${{ vars.MAX_RUN_MINUTES }}
           TRAIN_BEFORE: ${{ vars.TRAIN_BEFORE }}
-        run: python -m agent ${{ inputs.command || 'run' }}
+          EVENT_NAME: ${{ github.event_name }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          COMMAND: ${{ inputs.command || 'draft' }}
+        run: |
+          if [ "$EVENT_NAME" = "issues" ]; then
+            python -m agent publish --issue "$ISSUE_NUMBER"
+          else
+            python -m agent "$COMMAND"
+          fi
 
       - uses: actions/cache/save@v4
         if: always()

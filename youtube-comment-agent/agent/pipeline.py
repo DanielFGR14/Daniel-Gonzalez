@@ -1,4 +1,5 @@
-"""Los dos comandos del agente: ``train`` (aprender tu estilo) y ``run`` (responder)."""
+"""Lo que hace el agente: ``train`` (aprender tu estilo), ``draft`` + ``publish_approved`` (modo
+aprobación) y ``run`` (modo automático)."""
 
 from __future__ import annotations
 
@@ -16,7 +17,7 @@ from googleapiclient.errors import HttpError
 
 from .config import Config
 from .quality import NoveltyChecker, choose
-from .responder import build_instructions
+from .responder import Usage, build_instructions
 from .style import ExampleIndex, build_profile, extract_pairs
 from .youtube import WRITE_COST, QuotaExceeded, Thread, error_reason
 
@@ -58,6 +59,7 @@ class Store:
         self.profile_path = data_dir / "style_profile.json"
         self.posted_path = data_dir / "posted.json"
         self.attempts_path = data_dir / "attempts.json"
+        self.drafts_path = data_dir / "drafts.json"
         self.state_path = data_dir / "state.json"
 
     def posted(self) -> dict:
@@ -65,6 +67,9 @@ class Store:
 
     def attempts(self) -> dict:
         return _load_json(self.attempts_path, {})
+
+    def drafts(self) -> dict:
+        return _load_json(self.drafts_path, {})
 
     def state(self) -> dict:
         return _load_json(self.state_path, {})
@@ -241,30 +246,40 @@ def select_candidates(
     return chosen
 
 
-# -- ejecución diaria --------------------------------------------------------------
+# -- preparar respuestas ------------------------------------------------------------
 
 
-def run(
-    cfg: Config,
-    yt,
-    responder,
-    now: datetime | None = None,
-    sleep=time.sleep,
-    clock=time.monotonic,
-    rng: random.Random | None = None,
-) -> dict:
-    now = now or datetime.now(timezone.utc)
-    rng = rng or random.Random()
+def _new_summary(now: datetime, mode: str) -> dict:
+    return {
+        # Fecha de Colombia: a las 9 p. m. allá, en UTC ya es el día siguiente.
+        "date": now.astimezone(LOCAL_TZ).date().isoformat(),
+        "mode": mode,
+        "threads_checked": 0,
+        "candidates": {},
+        "status": Counter(),
+        "hidden_by_youtube": False,
+        "entries": [],
+    }
+
+
+def prepare(
+    cfg: Config, yt, responder, now: datetime, owner_id: str, summary: dict, pending: dict | None = None
+) -> list[tuple[str, dict]]:
+    """Elige los comentarios de hoy y genera una respuesta para cada uno.
+
+    ``pending`` son borradores que siguen esperando tu aprobación: no se vuelven a preparar y las
+    respuestas nuevas tampoco pueden parecerse a ellos. Devuelve la cola [(id_del_hilo, entrada)].
+    """
+    pending = pending or {}
     store = Store(cfg.data_dir)
-    owner_id = yt.my_channel_id()
 
     posted = prune_posted(store.posted(), now, cfg.retention_days)
     _save_json(store.posted_path, posted)
     attempts = prune_posted(store.attempts(), now, cfg.retention_days, key="last")
     _save_json(store.attempts_path, attempts)
-    # No volver a gastar tokens en lo ya publicado, en lo que el modelo decidió no responder
-    # ni en lo que ya se intentó MAX_ATTEMPTS veces.
-    handled = set(posted) | {
+    # No volver a gastar tokens en lo ya publicado, en lo que el modelo decidió no responder,
+    # en lo que ya se intentó MAX_ATTEMPTS veces ni en lo que espera tu aprobación.
+    handled = set(posted) | set(pending) | {
         tid for tid, a in attempts.items() if a.get("final") or a.get("count", 0) >= MAX_ATTEMPTS
     }
 
@@ -273,9 +288,6 @@ def run(
         train(cfg, yt, owner_id, now)
     pairs = _load_json(store.pairs_path, [])
     profile = store.profile()
-
-    if not cfg.dry_run and not cfg.train_before:
-        log.warning("Modo en vivo sin TRAIN_BEFORE: defínela para blindar el entrenamiento (ver README).")
 
     members = manual_members(cfg)
     api_members = yt.member_ids()
@@ -302,19 +314,11 @@ def run(
         cfg.max_member_replies, cfg.max_subscriber_replies, cfg.max_replies_per_author,
         cfg.include_non_subscribers,
     )
-    summary = {
-        # Fecha de Colombia: a las 9 p. m. allá, en UTC ya es el día siguiente.
-        "date": now.astimezone(LOCAL_TZ).date().isoformat(),
-        "dry_run": cfg.dry_run,
-        "threads_checked": len(threads),
-        "candidates": dict(Counter(c.tier for c in candidates)),
-        "status": Counter(),
-        "hidden_by_youtube": False,
-        "entries": [],
-    }
+    summary["threads_checked"] = len(threads)
+    summary["candidates"] = dict(Counter(c.tier for c in candidates))
     if not candidates:
         log.info("No hay comentarios nuevos que responder.")
-        return _finish(cfg, summary, yt, responder)
+        return []
 
     # 1. Generar opciones (pocas llamadas, en lotes).
     titles = yt.video_titles(c.thread.video_id for c in candidates)
@@ -335,12 +339,22 @@ def run(
     options = responder.generate(build_instructions(profile, cfg.variants), items, profile, cfg.batch_size)
 
     # 2. Elegir la mejor opción de cada uno: con tu estilo, pero distinta de todo lo ya escrito.
-    novelty = NoveltyChecker([p["reply"] for p in pairs] + [v.get("text", "") for v in posted.values()])
+    novelty = NoveltyChecker(
+        [p["reply"] for p in pairs]
+        + [v.get("text", "") for v in posted.values()]
+        + [d.get("reply", "") for d in pending.values()]
+    )
     queue = []
     for cand in candidates:
-        entry = {"tier": cand.tier, "author": cand.thread.top.author_name, "comment": cand.thread.top.text, "reply": None}
-        summary["entries"].append(entry)
         tid = cand.thread.id
+        entry = {
+            "thread_id": tid,
+            "tier": cand.tier,
+            "author": cand.thread.top.author_name,
+            "comment": cand.thread.top.text,
+            "reply": None,
+        }
+        summary["entries"].append(entry)
         if tid not in options:
             entry["status"] = "sin respuesta del modelo (se reintenta mañana)"
             continue
@@ -361,10 +375,24 @@ def run(
             continue
         novelty.add(best.text)  # las siguientes de esta noche tampoco podrán parecerse a esta
         entry["reply"] = best.text
-        queue.append((cand, entry))
+        queue.append((tid, entry))
     _save_json(store.attempts_path, attempts)
+    return queue
 
-    # 3. Publicar despacio, con pausas aleatorias entre respuestas.
+
+# -- publicar ------------------------------------------------------------------------
+
+
+def post_queue(
+    cfg: Config, yt, owner_id: str, queue: list[tuple[str, dict]], summary: dict, now: datetime,
+    sleep=None, clock=None, rng: random.Random | None = None,
+) -> None:
+    """Publica despacio, con pausas aleatorias, y se detiene ante cualquier señal de spam."""
+    sleep = sleep or time.sleep
+    clock = clock or time.monotonic
+    rng = rng or random.Random()
+    store = Store(cfg.data_dir)
+    posted = store.posted()
     state = store.state()
     started = clock()
     posted_any = False
@@ -374,10 +402,7 @@ def run(
         for _, pending in queue[from_position:]:
             pending["status"] = f"pendiente: {reason}"
 
-    for position, (cand, entry) in enumerate(queue):
-        if cfg.dry_run:
-            entry["status"] = "simulada (no publicada)"
-            continue
+    for position, (thread_id, entry) in enumerate(queue):
         if posted_any:
             delay = rng.uniform(cfg.min_delay_seconds, cfg.max_delay_seconds)
             if clock() - started + delay > cfg.max_run_minutes * 60:
@@ -397,7 +422,7 @@ def run(
 
         try:
             # Justo antes de publicar: ¿sigue existiendo y nadie (tú) lo respondió mientras tanto?
-            current = yt.fetch_thread(cand.thread.id)
+            current = yt.fetch_thread(thread_id)
             if current is None:
                 entry["status"] = "el comentario ya no existe"
                 continue
@@ -411,7 +436,7 @@ def run(
             if "live_since" not in state:
                 state["live_since"] = now.isoformat()
                 _save_json(store.state_path, state)
-            reply_id = yt.reply(cand.thread.id, entry["reply"])
+            reply_id = yt.reply(thread_id, entry["reply"])
         except HttpError as err:
             reason = error_reason(err) or str(err.status_code)
             entry["status"] = f"error de YouTube: {reason}"
@@ -420,17 +445,98 @@ def run(
                 stop(position + 1, f"YouTube respondió {reason}")
                 break
             continue
-        posted[cand.thread.id] = {"reply_id": reply_id, "posted_at": now.isoformat(), "text": entry["reply"]}
+        posted[thread_id] = {"reply_id": reply_id, "posted_at": now.isoformat(), "text": entry["reply"]}
         _save_json(store.posted_path, posted)
         entry["status"] = "publicada"
         posted_any = True
-        unverified = (cand.thread.id, reply_id, entry)
+        unverified = (thread_id, reply_id, entry)
 
     if unverified:  # verificar también la última
         sleep(cfg.min_delay_seconds)
         if not _confirm_visible(yt, unverified, sleep, cfg.min_delay_seconds):
             summary["hidden_by_youtube"] = True
+
+
+# -- los tres modos -------------------------------------------------------------------
+
+
+def run(
+    cfg: Config, yt, responder, now: datetime | None = None,
+    sleep=None, clock=None, rng: random.Random | None = None,
+) -> dict:
+    """Modo automático: prepara y publica sin pedir aprobación (o solo simula si DRY_RUN)."""
+    now = now or datetime.now(timezone.utc)
+    owner_id = yt.my_channel_id()
+    summary = _new_summary(now, "simulación (no se publicó nada)" if cfg.dry_run else "automático")
+    queue = prepare(cfg, yt, responder, now, owner_id, summary)
+    if cfg.dry_run:
+        for _, entry in queue:
+            entry["status"] = "simulada (no publicada)"
+    else:
+        post_queue(cfg, yt, owner_id, queue, summary, now, sleep, clock, rng)
     return _finish(cfg, summary, yt, responder)
+
+
+def draft(cfg: Config, yt, responder, now: datetime | None = None) -> tuple[dict, list[tuple[str, dict]]]:
+    """Modo aprobación, paso 1: prepara los borradores y los guarda hasta que decidas."""
+    now = now or datetime.now(timezone.utc)
+    store = Store(cfg.data_dir)
+    owner_id = yt.my_channel_id()
+    # Los borradores que nadie aprobó en LOOKBACK_DAYS días caducan.
+    pending = prune_posted(store.drafts(), now, cfg.lookback_days, key="created")
+    summary = _new_summary(now, "borradores para aprobar")
+    queue = prepare(cfg, yt, responder, now, owner_id, summary, pending)
+    for thread_id, entry in queue:
+        entry["status"] = "esperando tu aprobación"
+        pending[thread_id] = {**entry, "created": now.isoformat()}
+    _save_json(store.drafts_path, pending)
+    return _finish(cfg, summary, yt, responder), queue
+
+
+def set_draft_issue(cfg: Config, thread_ids: list[str], issue_number: int) -> None:
+    store = Store(cfg.data_dir)
+    drafts = store.drafts()
+    for thread_id in thread_ids:
+        if thread_id in drafts:
+            drafts[thread_id]["issue"] = issue_number
+    _save_json(store.drafts_path, drafts)
+
+
+def publish_approved(
+    cfg: Config, yt, approvals: list, approve_all: bool, now: datetime | None = None,
+    reject_all: bool = False, sleep=None, clock=None, rng: random.Random | None = None,
+) -> dict:
+    """Modo aprobación, paso 2: publica solo lo que aprobaste (con tus ediciones)."""
+    now = now or datetime.now(timezone.utc)
+    store = Store(cfg.data_dir)
+    owner_id = yt.my_channel_id()
+    drafts = store.drafts()
+    attempts = store.attempts()
+    summary = _new_summary(now, "publicación de lo aprobado")
+    queue = []
+    for approval in approvals:
+        saved = drafts.pop(approval.thread_id, None)
+        if saved is None:
+            continue  # no es un borrador del agente, o ya se procesó
+        entry = {k: saved[k] for k in ("thread_id", "tier", "author", "comment", "style", "closest_similarity") if k in saved}
+        entry["reply"] = None
+        summary["entries"].append(entry)
+        if reject_all or not (approve_all or approval.checked):
+            entry["status"] = "no aprobada"
+            _attempt(attempts, approval.thread_id, now, final=True)
+            continue
+        text = approval.reply.strip()
+        if not text:
+            entry["status"] = "no publicada: la respuesta quedó vacía"
+            _attempt(attempts, approval.thread_id, now, final=True)
+            continue
+        entry["reply"] = text
+        entry["edited"] = text != saved.get("reply")
+        queue.append((approval.thread_id, entry))
+    _save_json(store.drafts_path, drafts)
+    _save_json(store.attempts_path, attempts)
+    post_queue(cfg, yt, owner_id, queue, summary, now, sleep, clock, rng)
+    return _finish(cfg, summary, yt, None)
 
 
 def _confirm_visible(yt, published: tuple, sleep, wait: float) -> bool:
@@ -449,8 +555,8 @@ def _confirm_visible(yt, published: tuple, sleep, wait: float) -> bool:
     return False
 
 
-def _finish(cfg: Config, summary: dict, yt, responder) -> dict:
-    usage = responder.usage
+def _finish(cfg: Config, summary: dict, yt, responder=None) -> dict:
+    usage = responder.usage if responder else Usage()
     summary["status"] = dict(Counter(e.get("status", "sin procesar") for e in summary["entries"]))
     summary["youtube_quota_units"] = yt.units_used
     summary["openai"] = {
@@ -466,9 +572,8 @@ def _finish(cfg: Config, summary: dict, yt, responder) -> dict:
 
 
 def _write_markdown_report(path: Path, summary: dict) -> None:
-    mode = "SIMULACIÓN (no se publicó nada)" if summary["dry_run"] else "EN VIVO"
     lines = [
-        f"# Respuestas del {summary['date']} — {mode}",
+        f"# Respuestas del {summary['date']} — {summary['mode']}",
         "",
     ]
     if summary.get("hidden_by_youtube"):

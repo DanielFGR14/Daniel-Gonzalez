@@ -2,8 +2,8 @@
 
 Responde los comentarios de tu canal **como tú escribes**, pero con respuestas nuevas, nunca
 copiadas. Atiende primero a los **miembros del canal** y después a unos cuantos comentarios de
-**suscriptores y otros espectadores**. Se ejecuta solo todos los días a las **9:05 p. m. hora
-Colombia** con GitHub Actions, y publica despacio, con pausas aleatorias.
+**suscriptores y otros espectadores**. Todos los días a las **9:05 p. m. hora Colombia** prepara las
+respuestas y **te las pide aprobar**; solo publica lo que tú marcas, despacio y con pausas aleatorias.
 
 ## Cómo funciona
 
@@ -11,18 +11,26 @@ Colombia** con GitHub Actions, y publica despacio, con pausas aleatorias.
    canal y guarda **solo** los pares *comentario de otra persona → tu respuesta*. Con eso arma un
    perfil de tu estilo: largo típico, palabras que más usas, emojis, cómo empiezas y cómo cierras, y
    ~20 respuestas reales tuyas como ejemplo. No usa nada que no hayas escrito tú.
-2. **Respuesta diaria (`run`).**
+2. **Borradores cada noche (`draft`).**
    - Lee los comentarios de los últimos 3 días que aún no respondiste.
    - Toma **primero a los miembros** (hasta 30 por noche, del comentario más viejo al más nuevo) y
      luego **5 comentarios más** (los de suscriptores visibles primero, después los que tienen más "me gusta").
    - Le pide a `gpt-6-luna` **2 opciones por comentario** en lotes de 10 y elige la mejor (ver abajo).
      Si un comentario es spam, delicado o algo que solo tú sabrías responder, el modelo lo **salta**.
-   - **Publica despacio:** entre una respuesta y otra espera un tiempo al azar de **30 a 120 segundos**.
-     Como máximo publica durante 60 minutos; lo que no alcance queda para la noche siguiente.
-   - Justo antes de publicar revisa que el comentario siga existiendo y que no lo hayas respondido tú
-     mientras tanto.
+   - Abre un **issue en este repositorio** con todas las respuestas propuestas y te menciona, así que
+     te llega el aviso por correo y en la app de GitHub.
+3. **Tú apruebas.** En el issue marcas *Publicar esta* en las que quieras (o *Aprobar TODAS*). Puedes
+   editar el texto de cualquier respuesta. Cuando terminas, **cierras el issue**. Si lo cierras como
+   *no planeado*, no se publica nada. Si no lo cierras en 3 días, caduca.
+4. **Publicación (`publish`), al cerrar el issue.**
+   - Publica solo lo que marcaste, con tu texto final.
+   - **Despacio:** entre una respuesta y otra espera un tiempo al azar de **30 a 120 segundos**, como
+     máximo durante 60 minutos.
+   - Justo antes de cada una revisa que el comentario siga existiendo y que no lo hayas respondido
+     tú mientras tanto.
    - Después de publicar comprueba que YouTube **muestre** la respuesta. Si la oculta (señal de
-     posible spam), **se detiene esa noche** y la ejecución falla a propósito para que GitHub te avise por correo.
+     posible spam), **se detiene** y la ejecución falla a propósito para que GitHub te avise por correo.
+   - Al terminar **borra el contenido del issue** y deja solo los totales (regla de datos de YouTube).
 
 ### Parecida a ti, pero nunca una copia
 
@@ -58,7 +66,7 @@ Resumen de las reglas que aplican a este agente, y qué hace el agente con cada 
 
 | Regla de YouTube / Google | Qué hace el agente |
 |---|---|
-| **Consentimiento y control final.** Las políticas de la API piden que el usuario haya dado su consentimiento *previo, específico y expreso* antes de automatizar comentarios, y que tenga *el control final* de lo que se publica. | Arranca en **modo simulación**. Solo publica cuando tú mismo creas `DRY_RUN=false`. Cada noche deja un reporte con todo lo publicado y lo puedes apagar cuando quieras. La lectura más estricta de "control final" sería aprobar cada respuesta antes de publicarla; hoy el agente no tiene ese paso. |
+| **Consentimiento y control final.** Las políticas de la API piden que el usuario haya dado su consentimiento *previo, específico y expreso* antes de automatizar comentarios, y que tenga *el control final* de lo que se publica. | **Nada se publica sin tu aprobación.** Cada noche apruebas (y puedes editar) respuesta por respuesta en un issue; solo se publica lo que marcas al cerrarlo. |
 | **Spam en comentarios.** Prohibido dejar muchos comentarios idénticos, no dirigidos o repetitivos. YouTube avisa que publicar mucho en poco tiempo, repetir el mismo comentario, poner enlaces o abusar de los emojis puede marcarse como spam. | Cada respuesta es única y responde a ese comentario. Nunca pone enlaces ni hashtags, y descarta respuestas con exceso de emojis (más de 3, salvo que tú uses más). Hace pausas al azar, tiene un tope diario moderado (35) y **se detiene si YouTube oculta una respuesta**. |
 | **Interacción falsa e incentivos.** Prohibido inflar métricas con sistemas automáticos y ofrecer recompensas por comentar o suscribirse. Invitar a suscribirse sí está permitido. | El modelo tiene prohibido pedir likes, suscripciones o compras y ofrecer algo a cambio. Solo responde comentarios reales de tu propio canal. |
 | **Datos de la API: máximo 30 días.** Lo guardado (textos de comentarios, IDs) se debe borrar o refrescar a los 30 días. Si revocas el acceso o el token ya no se puede renovar, hay que borrar los datos. | Reentrena cada 25 días, lo que refresca los datos y hace desaparecer lo que se borró en YouTube. Borra los registros de más de 30 días. Los reportes duran 7 días. Si el token deja de servir, **borra los datos** (GitHub elimina solas las copias viejas de la caché a los 7 días sin uso). |
@@ -125,36 +133,32 @@ En el repo: **Settings → Secrets and variables → Actions → New repository 
 | `OPENAI_API_KEY` | del paso 2 |
 | `MEMBER_CHANNEL_IDS` | del paso 3 (va como secreto para que la lista no quede pública) |
 
-### 5. Primera prueba (modo simulación)
+### 5. Unir la rama a `master`
 
-El agente arranca en **modo simulación**: genera las respuestas pero **no publica nada**.
+GitHub solo ejecuta los trabajos programados desde la rama principal.
 
-1. **Actions → Agente de comentarios de YouTube → Run workflow** con `command = train`.
-2. Luego otra vez con `command = run`.
-3. Descarga el artefacto `reporte-…`: trae cada comentario con la respuesta que habría publicado,
-   su puntaje de estilo y su parecido con tu respuesta real más cercana.
+### 6. Primera prueba
 
-### 6. Activarlo de verdad
+1. **Actions → Agente de comentarios de YouTube → Run workflow** con `command = train`. Revisa en
+   el log cuántas respuestas tuyas encontró.
+2. Otra vez con `command = draft`. En unos minutos aparece el issue con los borradores.
+3. Revísalos. Si no te convencen, ciérralo como *no planeado* y ajusta las variables de abajo. Si
+   te gustan, marca las que quieras y ciérralo: se publican.
 
-Cuando te gusten las respuestas: **Settings → Secrets and variables → Actions → Variables →
-New repository variable**:
-
-- `DRY_RUN` = `false`. Desde esa noche publica solo.
-- `TRAIN_BEFORE` = la fecha de hoy (ej. `2026-09-24`). Es una protección extra para que, si algún
-  día se reentrena, nunca aprenda de respuestas escritas por el agente.
+Desde ahí se repite solo cada noche. Para apagarlo: **Actions → Agente de comentarios de YouTube →
+⋯ → Disable workflow**.
 
 ## Ajustes opcionales (variables del repositorio)
 
 | Variable | Por defecto | Qué hace |
 |---|---|---|
-| `DRY_RUN` | `true` | `false` para publicar de verdad |
 | `OPENAI_MODEL` | `gpt-6-luna` | Modelo de OpenAI |
 | `VARIANTS_PER_COMMENT` | `2` | Opciones que el modelo propone por comentario |
 | `MAX_SIMILARITY` | `0.75` | Parecido máximo con cualquier respuesta existente (1 = copia exacta) |
 | `MIN_STYLE_SCORE` | `0.5` | Puntaje de estilo mínimo para publicar |
 | `MIN_DELAY_SECONDS` / `MAX_DELAY_SECONDS` | `30` / `120` | Pausa al azar entre respuestas |
 | `MAX_RUN_MINUTES` | `60` | Tiempo máximo publicando cada noche (si lo subes de 80, sube también `timeout-minutes` en el workflow) |
-| `LOOKBACK_DAYS` | `3` | Cuántos días hacia atrás buscar comentarios sin responder |
+| `LOOKBACK_DAYS` | `3` | Cuántos días hacia atrás buscar comentarios sin responder (y días antes de que caduque un issue sin aprobar) |
 | `MAX_MEMBER_REPLIES` | `30` | Tope por noche de respuestas a miembros |
 | `MAX_SUBSCRIBER_REPLIES` | `5` | Respuestas por noche a no miembros |
 | `MAX_REPLIES_PER_AUTHOR` | `2` | Máximo de respuestas por persona y noche |
@@ -171,10 +175,13 @@ New repository variable**:
 - **Horario:** GitHub puede retrasar los trabajos programados en horas de mucha carga. En repositorios
   públicos desactiva la programación tras 60 días sin actividad en el repo; en ese caso se reactiva
   desde la pestaña Actions.
+- **Un issue a la vez:** si cierras dos issues de borradores seguidos mientras el agente publica,
+  GitHub puede descartar uno de los dos en la fila. Cierra el siguiente cuando termine el anterior.
 - **Privacidad:** el texto de los comentarios se envía a OpenAI para generar las respuestas (con
   `store=false`). En un repo público los logs de Actions son públicos: el agente solo escribe totales
-  en los logs, y el detalle va en el artefacto del reporte, que se borra a los 7 días. Aun así,
-  conviene que el repositorio sea privado.
+  en los logs, y el detalle va en el artefacto del reporte, que se borra a los 7 días. Pero los
+  **issues de borradores sí se ven** mientras esperan tu aprobación (comentarios, respuestas y quién
+  es miembro). Por eso conviene que el repositorio sea **privado**; el modo aprobación funciona igual.
 
 ## Desarrollo
 
