@@ -1,4 +1,5 @@
 data/
+reports/
 client_secret*.json
 .env
 .venv/

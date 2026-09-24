@@ -18,6 +18,11 @@ def _int(name: str, default: int) -> int:
     return int(value) if value else default
 
 
+def _float(name: str, default: float) -> float:
+    value = _str(name)
+    return float(value) if value else default
+
+
 def _bool(name: str, default: bool) -> bool:
     value = _str(name).lower()
     if not value:
@@ -40,6 +45,7 @@ class Config:
     reasoning_effort: str = "none"
     service_tier: str = "flex"
     batch_size: int = 10
+    variants: int = 2
 
     # Qué responder
     dry_run: bool = True
@@ -49,15 +55,28 @@ class Config:
     max_replies_per_author: int = 2
     include_non_subscribers: bool = False
 
+    # Parecida a ti, pero nunca una copia
+    max_similarity: float = 0.75
+    min_style_score: float = 0.5
+
+    # Ritmo humano: pausa aleatoria entre una respuesta y la siguiente
+    min_delay_seconds: int = 45
+    max_delay_seconds: int = 180
+    max_run_minutes: int = 120
+
     # Entrenamiento
     examples_per_comment: int = 3
     canonical_examples: int = 20
     train_before: datetime | None = None
+    # Las políticas de YouTube piden refrescar o borrar los datos de la API cada 30 días.
+    retrain_days: int = 25
+    retention_days: int = 30
 
     # YouTube: cuota diaria gratuita es 10.000 unidades; dejamos margen.
     quota_budget: int = 9000
 
     data_dir: Path = Path("data")
+    reports_dir: Path = Path("reports")
     members_file: Path = Path("members.txt")
 
     @classmethod
@@ -67,16 +86,25 @@ class Config:
             reasoning_effort=_str("OPENAI_REASONING_EFFORT", cls.reasoning_effort),
             service_tier=_str("OPENAI_SERVICE_TIER", cls.service_tier),
             batch_size=_int("BATCH_SIZE", cls.batch_size),
+            variants=_int("VARIANTS_PER_COMMENT", cls.variants),
             dry_run=_bool("DRY_RUN", cls.dry_run),
             lookback_days=_int("LOOKBACK_DAYS", cls.lookback_days),
             max_member_replies=_int("MAX_MEMBER_REPLIES", cls.max_member_replies),
             max_subscriber_replies=_int("MAX_SUBSCRIBER_REPLIES", cls.max_subscriber_replies),
             max_replies_per_author=_int("MAX_REPLIES_PER_AUTHOR", cls.max_replies_per_author),
             include_non_subscribers=_bool("INCLUDE_NON_SUBSCRIBERS", cls.include_non_subscribers),
+            max_similarity=_float("MAX_SIMILARITY", cls.max_similarity),
+            min_style_score=_float("MIN_STYLE_SCORE", cls.min_style_score),
+            min_delay_seconds=_int("MIN_DELAY_SECONDS", cls.min_delay_seconds),
+            max_delay_seconds=_int("MAX_DELAY_SECONDS", cls.max_delay_seconds),
+            max_run_minutes=_int("MAX_RUN_MINUTES", cls.max_run_minutes),
             examples_per_comment=_int("EXAMPLES_PER_COMMENT", cls.examples_per_comment),
             canonical_examples=_int("CANONICAL_EXAMPLES", cls.canonical_examples),
             train_before=_date("TRAIN_BEFORE"),
+            retrain_days=_int("RETRAIN_DAYS", cls.retrain_days),
+            retention_days=_int("RETENTION_DAYS", cls.retention_days),
             quota_budget=_int("YT_QUOTA_BUDGET", cls.quota_budget),
             data_dir=Path(_str("DATA_DIR", str(cls.data_dir))),
+            reports_dir=Path(_str("REPORTS_DIR", str(cls.reports_dir))),
             members_file=Path(_str("MEMBERS_FILE", str(cls.members_file))),
         )

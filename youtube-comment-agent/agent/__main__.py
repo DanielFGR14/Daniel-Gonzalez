@@ -42,13 +42,13 @@ def main() -> int:
 
         from .responder import Responder
 
-        responder = Responder.from_env(cfg.openai_model, cfg.reasoning_effort, cfg.service_tier)
+        responder = Responder.from_env(cfg.openai_model, cfg.reasoning_effort, cfg.service_tier, cfg.variants)
         summary = run(cfg, yt, responder)
     except QuotaExceeded as err:
         print(f"Cuota de YouTube agotada por hoy: {err}", file=sys.stderr)
         return 1
 
-    # En los logs solo van totales; el detalle (comentarios y respuestas) queda en data/reports/.
+    # En los logs solo van totales; el detalle (comentarios y respuestas) queda en reports/.
     totals = {k: v for k, v in summary.items() if k != "entries"}
     print(json.dumps(totals, ensure_ascii=False, indent=2))
     step_summary = os.environ.get("GITHUB_STEP_SUMMARY")

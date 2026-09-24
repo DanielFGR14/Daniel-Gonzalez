@@ -21,6 +21,14 @@ class QuotaExceeded(RuntimeError):
     pass
 
 
+def error_reason(err: Exception) -> str:
+    """El 'reason' de un HttpError de Google (p. ej. quotaExceeded, commentsDisabled)."""
+    details = getattr(err, "error_details", None)
+    if isinstance(details, list) and details and isinstance(details[0], dict):
+        return details[0].get("reason", "") or ""
+    return getattr(err, "reason", "") or ""
+
+
 @dataclass
 class Comment:
     id: str
@@ -141,6 +149,17 @@ class YouTube:
                 return
             if since and threads and all(t.top.published_at < since for t in threads):
                 return
+
+    def fetch_thread(self, thread_id: str) -> Thread | None:
+        """El hilo tal como está ahora (None si lo borraron)."""
+        resp = self._execute(
+            self.api.commentThreads().list(part="snippet,replies", id=thread_id, textFormat="plainText")
+        )
+        items = resp.get("items") or []
+        if not items:
+            return None
+        thread = parse_thread(items[0])
+        return self.complete_replies(thread) if thread.replies_truncated else thread
 
     def complete_replies(self, thread: Thread) -> Thread:
         """commentThreads.list solo trae algunas respuestas; esto trae todas."""

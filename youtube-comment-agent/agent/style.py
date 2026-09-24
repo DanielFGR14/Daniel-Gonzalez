@@ -149,15 +149,18 @@ def build_profile(pairs: list[dict], canonical_count: int = 20) -> dict:
     return {
         "examples_total": len(pairs),
         "median_words": int(statistics.median(word_counts)) if word_counts else 0,
+        "p10_words": _percentile(word_counts, 0.1) if word_counts else 0,
         "p90_words": _percentile(word_counts, 0.9) if word_counts else 0,
         "p90_chars": _percentile([len(r) for r in replies], 0.9) if replies else 0,
         "emoji_rate": _rate(replies, lambda r: bool(EMOJI_RE.search(r))),
         "exclamation_rate": _rate(replies, lambda r: "!" in r),
         "question_rate": _rate(replies, lambda r: "?" in r),
         "capitalized_rate": _rate(replies, lambda r: r[:1].isupper()),
-        "link_rate": _rate(replies, lambda r: bool(URL_RE.search(r))),
         "top_words": [w for w, _ in vocabulary.most_common(60)],
         "top_emojis": [e for e, _ in emojis.most_common(12)],
+        # Para medir el estilo de cada respuesta nueva.
+        "vocabulary": [w for w, _ in vocabulary.most_common(5000)],
+        "emojis": [e for e, _ in emojis.most_common(50)],
         "openers": _edge_phrases(replies, first=True, top=10),
         "closers": _edge_phrases(replies, first=False, top=10),
         "canonical_examples": [

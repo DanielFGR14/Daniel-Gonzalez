@@ -27,7 +27,8 @@ permissions:
 jobs:
   agent:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Las pausas entre respuestas hacen que tarde hasta MAX_RUN_MINUTES (120 por defecto).
+    timeout-minutes: 150
     defaults:
       run:
         working-directory: youtube-comment-agent
@@ -63,6 +64,12 @@ jobs:
           MAX_SUBSCRIBER_REPLIES: ${{ vars.MAX_SUBSCRIBER_REPLIES }}
           MAX_REPLIES_PER_AUTHOR: ${{ vars.MAX_REPLIES_PER_AUTHOR }}
           INCLUDE_NON_SUBSCRIBERS: ${{ vars.INCLUDE_NON_SUBSCRIBERS }}
+          VARIANTS_PER_COMMENT: ${{ vars.VARIANTS_PER_COMMENT }}
+          MAX_SIMILARITY: ${{ vars.MAX_SIMILARITY }}
+          MIN_STYLE_SCORE: ${{ vars.MIN_STYLE_SCORE }}
+          MIN_DELAY_SECONDS: ${{ vars.MIN_DELAY_SECONDS }}
+          MAX_DELAY_SECONDS: ${{ vars.MAX_DELAY_SECONDS }}
+          MAX_RUN_MINUTES: ${{ vars.MAX_RUN_MINUTES }}
           TRAIN_BEFORE: ${{ vars.TRAIN_BEFORE }}
         run: python -m agent ${{ inputs.command || 'run' }}
 
@@ -76,6 +83,6 @@ jobs:
         if: always()
         with:
           name: reporte-${{ github.run_id }}
-          path: youtube-comment-agent/data/reports/
+          path: youtube-comment-agent/reports/
           retention-days: 7
           if-no-files-found: ignore

@@ -3,11 +3,17 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import httplib2
+from googleapiclient.errors import HttpError
+
 from agent.config import Config
-from agent.pipeline import MEMBER, OTHER, SUBSCRIBER, run, select_candidates, train
+from agent.pipeline import (
+    MEMBER, OTHER, SUBSCRIBER, Store, needs_training, prune_posted, run, select_candidates, train,
+)
+from agent.quality import NoveltyChecker, choose, normalize, similarity
 from agent.responder import Responder, build_instructions, clean_reply
 from agent.style import ExampleIndex, build_profile, extract_pairs
-from agent.youtube import Comment, Thread, parse_thread
+from agent.youtube import Comment, Thread, error_reason, parse_thread
 
 OWNER = "UCowner"
 NOW = datetime(2026, 9, 25, 2, 0, tzinfo=timezone.utc)
@@ -67,10 +73,11 @@ def test_build_profile_captures_style():
     profile = build_profile(sample_pairs(), canonical_count=2)
     assert profile["examples_total"] == 4
     assert profile["emoji_rate"] == 1.0
-    assert profile["top_emojis"] == ["🙏"]
-    assert "gracias" in profile["top_words"]
+    assert profile["top_emojis"] == ["🙏"] and profile["emojis"] == ["🙏"]
+    assert "gracias" in profile["top_words"] and "descansa" in profile["vocabulary"]
     assert len(profile["canonical_examples"]) == 2
-    assert "Descansa" in build_instructions(profile) or "gracias" in build_instructions(profile)
+    instructions = build_instructions(profile, variants=2)
+    assert "NO copies" in instructions and "2 opciones" in instructions
 
 
 def test_example_index_finds_similar_comment():
@@ -79,6 +86,44 @@ def test_example_index_finds_similar_comment():
     assert len(hits) == 2
     assert all("dormir" in h["comment"] for h in hits)
     assert index.search("", k=2) == []
+
+
+# -- parecida pero distinta ----------------------------------------------------------
+
+
+def test_similarity_ignores_case_accents_punctuation_and_emojis():
+    assert normalize("¡Gracias, Qué BONITO!! 🙏") == "gracias que bonito"
+    assert similarity("Gracias!! 🙏", "gracias") == 1.0
+    assert similarity("gracias por verlo descansa mucho", "gracias por escucharlo descansa mucho") > 0.75
+    assert similarity("que lindo mensaje gracias por estar aqui", "gracias por estar aqui siempre") < 0.75
+
+
+def test_choose_rejects_copies_and_prefers_own_style():
+    profile = build_profile(sample_pairs())
+    novelty = NoveltyChecker([p["reply"] for p in sample_pairs()])
+
+    copy = choose(["Gracias a ti por verlo!! 🙏"], profile, novelty)
+    assert not copy.accepted and "parecida" in copy.reason
+
+    best = choose(
+        [
+            "Gracias a ti por verlo 🙏",  # copia -> descartada
+            "Qué alegría que te ayude a dormir!! Descansa mucho esta noche 🙏",  # nueva y con tu estilo
+            "Estimado usuario, agradecemos profundamente su valiosa retroalimentación corporativa.",
+        ],
+        profile, novelty, context="me ayuda a dormir",
+    )
+    assert best.accepted and best.text.startswith("Qué alegría")
+    assert 0 < best.closest_similarity < 0.75
+
+    stiff = choose(["Estimado usuario, agradecemos profundamente su valiosa retroalimentación corporativa."], profile, novelty)
+    assert not stiff.accepted and "no suena a ti" in stiff.reason
+
+
+def test_novelty_checker_blocks_repeats_within_same_night():
+    novelty = NoveltyChecker()
+    novelty.add("Qué alegría leerte, descansa mucho")
+    assert novelty.closest("que alegria leerte!! descansa mucho 🙏")[0] == 1.0
 
 
 # -- selección -----------------------------------------------------------------------
@@ -113,7 +158,18 @@ def test_select_members_first_then_few_subscribers():
 # -- generación --------------------------------------------------------------------
 
 
+# Respuestas nuevas (con tu estilo) que el modelo simulado propone para cada hilo.
+NEW_REPLIES = {
+    "n0": "Qué bueno leerte, descansa mucho esta noche 🙏",
+    "n1": "Me alegra que te sirva para dormir, un abrazo grande 🙏",
+    "n2": "Gracias a ti por estar siempre por aquí 🙏",
+    "n3": "Qué bonito lo que dices, dulces sueños 🙏",
+}
+
+
 class FakeOpenAI:
+    """Devuelve 2 opciones por comentario: una copia de una respuesta vieja y una nueva."""
+
     def __init__(self, fail_flex=False):
         self.calls = []
         self.fail_flex = fail_flex
@@ -125,7 +181,12 @@ class FakeOpenAI:
             raise RuntimeError("flex no disponible")
         items = json.loads(kwargs["input"])["comentarios"]
         replies = [
-            {"id": it["id"], "skip": "spam" in it["comentario"], "reply": f"Gracias {it['id']} 🙏"} for it in items
+            {
+                "id": it["id"],
+                "skip": "spam" in it["comentario"],
+                "options": ["Descansa mucho 🙏", NEW_REPLIES.get(it["id"], f"Mil gracias por escribir {it['id']} 🙏")],
+            }
+            for it in items
         ]
         usage = SimpleNamespace(input_tokens=100, output_tokens=20, input_tokens_details=SimpleNamespace(cached_tokens=80))
         return SimpleNamespace(output_text=json.dumps({"replies": replies}), usage=usage)
@@ -137,7 +198,8 @@ def test_responder_batches_and_respects_skip():
     profile = build_profile(sample_pairs())
     items = [{"id": f"t{i}", "comentario": "spam aquí" if i == 2 else "hola"} for i in range(5)]
     out = responder.generate("instr", items, profile, batch_size=3)
-    assert set(out) == {"t0", "t1", "t3", "t4"}
+    assert set(out) == {"t0", "t1", "t2", "t3", "t4"} and len(out["t0"]) == 2
+    assert out["t2"] is None  # el modelo decidió no responder
     # 2 lotes, cada uno falla con flex y se reintenta sin él.
     assert len(fake.calls) == 4
     assert fake.calls[0]["reasoning"] == {"effort": "none"}
@@ -146,9 +208,11 @@ def test_responder_batches_and_respects_skip():
 
 
 def test_clean_reply_guards():
-    profile = {"link_rate": 0, "p90_chars": 40}
+    profile = {"p90_chars": 40}
     assert clean_reply('"@fan Gracias!"', profile) == "Gracias!"
     assert clean_reply("mira https://x.com", profile) is None
+    assert clean_reply("mira www.x.com", profile) is None
+    assert clean_reply("gracias #dormir", profile) is None
     assert clean_reply("x" * 400, profile) is None
     assert clean_reply("   ", profile) is None
 
@@ -162,6 +226,7 @@ class FakeYouTube:
         self.members = members
         self.units_used = 0
         self.posted = []
+        self.fail_with = {}
 
     def my_channel_id(self):
         return OWNER
@@ -171,6 +236,9 @@ class FakeYouTube:
 
     def complete_replies(self, t):
         return t
+
+    def fetch_thread(self, thread_id):
+        return next((t for t in self.threads if t.id == thread_id), None)
 
     def member_ids(self):
         return self.members
@@ -185,42 +253,141 @@ class FakeYouTube:
         return True
 
     def reply(self, parent_id, text):
+        if parent_id in self.fail_with:
+            reason = self.fail_with[parent_id]
+            content = json.dumps({"error": {"errors": [{"reason": reason}], "message": reason}}).encode()
+            raise HttpError(httplib2.Response({"status": 403}), content)
         self.posted.append((parent_id, text))
         return f"r-{parent_id}"
 
 
-def test_run_trains_then_replies_and_never_repeats(tmp_path):
-    history = [
-        thread(f"h{i}", c(f"q{i}", f"UCf{i}", "me ayudó a dormir", hours_ago=500), [c(f"a{i}", OWNER, "Descansa 🙏", hours_ago=499)])
-        for i in range(3)
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps = []
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+    def __call__(self):
+        return self.now
+
+
+HISTORY = [
+    ("me ayudó a dormir", "Descansa mucho 🙏"),
+    ("gracias por subir esto", "Gracias a ti por escucharlo!! 🙏"),
+    ("lo escucho todas las noches", "Me alegra mucho que te sirva, un abrazo 🙏"),
+    ("hermoso video", "Qué bueno leerte, dulces sueños 🙏"),
+    ("siempre aquí", "Gracias por estar aquí 🙏"),
+]
+
+
+def history():
+    return [
+        thread(f"h{i}", c(f"q{i}", f"UCf{i}", q, hours_ago=500), [c(f"a{i}", OWNER, r, hours_ago=499)])
+        for i, (q, r) in enumerate(HISTORY)
     ]
-    new = [thread("n1", c("n1c", "UCmem", "gracias por este audio")), thread("n2", c("n2c", "UCmem", "spam spam"))]
-    yt = FakeYouTube(history + new, members={"UCmem"})
-    cfg = replace(Config(), data_dir=tmp_path, dry_run=False)
 
-    summary = run(cfg, yt, Responder(FakeOpenAI(), "gpt-6-luna"), now=NOW)
-    assert summary["posted"] == 1 and summary["skipped_by_model"] == 1
-    assert yt.posted == [("n1", "Gracias n1 🙏")]
+
+def test_run_trains_rejects_copies_and_never_repeats(tmp_path):
+    new = [thread("n1", c("n1c", "UCmem", "gracias por este audio")), thread("n9", c("n9c", "UCmem", "spam spam"))]
+    yt = FakeYouTube(history() + new, members={"UCmem"})
+    cfg = replace(Config(), data_dir=tmp_path / "data", reports_dir=tmp_path / "reports", dry_run=False)
+    clock = FakeClock()
+
+    summary = run(cfg, yt, Responder(FakeOpenAI(), "gpt-6-luna"), now=NOW, sleep=clock.sleep, clock=clock)
+    # La opción "Descansa 🙏" es copia de una respuesta vieja: se publica la otra.
+    assert yt.posted == [("n1", NEW_REPLIES["n1"])]
+    assert summary["status"] == {"publicada": 1, "omitido por el modelo": 1}
     assert (tmp_path / "reports" / "2026-09-25.md").exists()
+    assert not (tmp_path / "data" / "reports").exists()
 
-    # Segunda ejecución: no vuelve a responder el mismo hilo.
-    again = run(cfg, yt, Responder(FakeOpenAI(), "gpt-6-luna"), now=NOW)
-    assert again["posted"] == 0 and len(yt.posted) == 1
+    # Segunda ejecución: no vuelve a responder el mismo hilo ni gasta tokens en el spam ya descartado.
+    again = run(cfg, yt, Responder(FakeOpenAI(), "gpt-6-luna"), now=NOW, sleep=clock.sleep, clock=clock)
+    assert again["status"] == {} and again["openai"]["calls"] == 0 and len(yt.posted) == 1
 
     # Reentrenar no aprende de lo que publicó el agente.
-    yt.threads[3].replies.append(c("r-n1", OWNER, "Gracias n1 🙏"))
-    profile = train(cfg, yt)
-    assert profile["examples_total"] == 3
+    yt.fetch_thread("n1").replies.append(c("r-n1", OWNER, yt.posted[0][1]))
+    assert train(cfg, yt, now=NOW)["examples_total"] == len(HISTORY)
 
 
-def test_dry_run_posts_nothing(tmp_path):
-    history = [thread("h", c("q", "UCf", "hola"), [c("a", OWNER, "Hola!!")])]
-    yt = FakeYouTube(history + [thread("n", c("nc", "UCmem", "hola"))], members={"UCmem"})
-    summary = run(replace(Config(), data_dir=tmp_path), yt, Responder(FakeOpenAI(), "m"), now=NOW)
-    assert summary["dry_run"] and yt.posted == [] and summary["entries"][0]["reply"]
+def test_run_waits_random_time_between_posts_and_respects_time_budget(tmp_path):
+    new = [thread(f"n{i}", c(f"n{i}c", f"UCm{i}", f"comentario {i}", hours_ago=10 - i)) for i in range(4)]
+    yt = FakeYouTube(history() + new, members={f"UCm{i}" for i in range(4)})
+    cfg = replace(
+        Config(), data_dir=tmp_path / "data", reports_dir=tmp_path / "r", dry_run=False,
+        min_delay_seconds=60, max_delay_seconds=120, max_run_minutes=5,
+    )
+    clock = FakeClock()
+    summary = run(cfg, yt, Responder(FakeOpenAI(), "m"), now=NOW, sleep=clock.sleep, clock=clock)
+
+    assert len(clock.sleeps) == len(yt.posted) - 1  # sin espera antes de la primera
+    assert all(60 <= s <= 120 for s in clock.sleeps)
+    assert sum(clock.sleeps) <= 5 * 60
+    assert summary["status"]["publicada"] == len(yt.posted) >= 3
+    assert summary["status"].get("pendiente: se acabó el tiempo de hoy", 0) == 4 - len(yt.posted)
 
 
-def test_parse_thread_from_api_payload():
+def test_run_rechecks_thread_and_stops_on_quota_error(tmp_path):
+    new = [thread(f"n{i}", c(f"n{i}c", f"UCm{i}", f"comentario {i}", hours_ago=10 - i)) for i in range(4)]
+    yt = FakeYouTube(history() + new, members={f"UCm{i}" for i in range(4)})
+    cfg = replace(Config(), data_dir=tmp_path / "data", reports_dir=tmp_path / "r", dry_run=False)
+    clock = FakeClock()
+
+    original_fetch = yt.fetch_thread
+
+    def fetch(thread_id):
+        current = original_fetch(thread_id)
+        if thread_id == "n0":  # respondiste tú a mano mientras el agente esperaba
+            current = replace(current, replies=[c("manual", OWNER, "gracias!")])
+        if thread_id == "n1":  # lo borraron
+            return None
+        return current
+
+    yt.fetch_thread = fetch
+    yt.fail_with = {"n2": "quotaExceeded"}
+    summary = run(cfg, yt, Responder(FakeOpenAI(), "m"), now=NOW, sleep=clock.sleep, clock=clock)
+    statuses = [e["status"] for e in summary["entries"]]
+    assert statuses == [
+        "ya lo respondiste tú",
+        "el comentario ya no existe",
+        "error de YouTube: quotaExceeded",
+        "pendiente: YouTube respondió quotaExceeded",
+    ]
+    assert yt.posted == []  # tras quotaExceeded no intenta el cuarto
+
+
+def test_dry_run_posts_nothing_and_does_not_wait(tmp_path):
+    yt = FakeYouTube(history() + [thread("n0", c("a", "UCmem", "hola")), thread("n3", c("b", "UCmem", "otro"))], members={"UCmem"})
+    clock = FakeClock()
+    cfg = replace(Config(), data_dir=tmp_path / "data", reports_dir=tmp_path / "r")
+    summary = run(cfg, yt, Responder(FakeOpenAI(), "m"), now=NOW, sleep=clock.sleep, clock=clock)
+    assert summary["dry_run"] and yt.posted == [] and clock.sleeps == []
+    assert summary["status"] == {"simulada (no publicada)": 2}
+
+
+def test_data_is_refreshed_or_deleted_within_30_days(tmp_path):
+    store = Store(tmp_path)
+    assert needs_training(store, NOW, 25)
+    yt = FakeYouTube(history(), members=set())
+    cfg = replace(Config(), data_dir=tmp_path)
+    train(cfg, yt, now=NOW - timedelta(days=26))
+    assert needs_training(store, NOW, 25)
+    train(cfg, yt, now=NOW)
+    assert not needs_training(store, NOW, 25)
+
+    posted = {
+        "old": {"posted_at": (NOW - timedelta(days=31)).isoformat(), "text": "x"},
+        "new": {"posted_at": (NOW - timedelta(days=2)).isoformat(), "text": "y"},
+    }
+    assert set(prune_posted(posted, NOW, 30)) == {"new"}
+
+
+def test_error_reason_and_parse_thread_from_api_payload():
+    content = json.dumps({"error": {"errors": [{"reason": "commentsDisabled"}], "message": "x"}}).encode()
+    assert error_reason(HttpError(httplib2.Response({"status": 403}), content)) == "commentsDisabled"
+
     item = {
         "id": "T",
         "snippet": {
@@ -242,3 +409,21 @@ def test_parse_thread_from_api_payload():
     }
     t = parse_thread(item)
     assert t.top.like_count == 3 and t.replies[0].author_channel_id == OWNER and t.replies_truncated
+
+
+def test_rejected_comment_is_retried_at_most_twice(tmp_path):
+    class AlwaysCopies(FakeOpenAI):
+        def create(self, **kwargs):
+            items = json.loads(kwargs["input"])["comentarios"]
+            replies = [{"id": it["id"], "skip": False, "options": ["Descansa mucho!! 🙏"]} for it in items]
+            return SimpleNamespace(output_text=json.dumps({"replies": replies}), usage=None)
+
+    yt = FakeYouTube(history() + [thread("x", c("xc", "UCmem", "hola"))], members={"UCmem"})
+    cfg = replace(Config(), data_dir=tmp_path / "data", reports_dir=tmp_path / "r")
+    calls = []
+    for _ in range(3):
+        responder = Responder(AlwaysCopies(), "m")
+        summary = run(cfg, yt, responder, now=NOW, sleep=lambda s: None, clock=lambda: 0.0)
+        calls.append(responder.usage.calls)
+    assert calls == [1, 1, 0]
+    assert summary["status"] == {}

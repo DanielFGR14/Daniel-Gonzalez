@@ -4,6 +4,7 @@
 - Las instrucciones (tu estilo + ejemplos) son idénticas en cada llamada, así que OpenAI
   las cachea y cobra ~10% del precio a partir de la segunda.
 - ``reasoning.effort = none`` y ``service_tier = flex`` (mitad de precio) por defecto.
+- Pide varias opciones por comentario en la MISMA llamada; ``quality.choose`` elige la mejor.
 """
 
 from __future__ import annotations
@@ -18,7 +19,8 @@ from .style import URL_RE, strip_mentions
 log = logging.getLogger(__name__)
 
 HARD_MAX_CHARS = 1000
-TOKENS_PER_REPLY = 200
+TOKENS_PER_OPTION = 120
+HASHTAG_RE = re.compile(r"#[^\W\d_]")
 
 REPLIES_SCHEMA = {
     "type": "object",
@@ -30,9 +32,9 @@ REPLIES_SCHEMA = {
                 "properties": {
                     "id": {"type": "string"},
                     "skip": {"type": "boolean"},
-                    "reply": {"type": "string"},
+                    "options": {"type": "array", "items": {"type": "string"}},
                 },
-                "required": ["id", "skip", "reply"],
+                "required": ["id", "skip", "options"],
                 "additionalProperties": False,
             },
         }
@@ -42,7 +44,7 @@ REPLIES_SCHEMA = {
 }
 
 
-def build_instructions(profile: dict) -> str:
+def build_instructions(profile: dict, variants: int = 2) -> str:
     def join(values: list[str]) -> str:
         return ", ".join(values) if values else "(ninguno destacado)"
 
@@ -51,12 +53,17 @@ def build_instructions(profile: dict) -> str:
     )
     emoji_note = (
         f"Usas emojis en el {int(profile['emoji_rate'] * 100)}% de tus respuestas; los más comunes: "
-        f"{join(profile['top_emojis'])}."
+        f"{join(profile['top_emojis'])}. No uses otros."
         if profile["emoji_rate"] > 0
         else "Casi nunca usas emojis: no los pongas."
     )
+    options_rule = (
+        f'Para cada comentario escribe {variants} opciones en "options", distintas entre sí.'
+        if variants > 1
+        else 'Para cada comentario escribe 1 opción en "options".'
+    )
     return f"""Eres quien administra este canal de YouTube y respondes, en primera persona, a los comentarios de tu comunidad.
-Tu único objetivo es sonar EXACTAMENTE como en tus respuestas reales de abajo: mismo tono, largo, vocabulario, puntuación y forma de saludar y despedirte. Si una palabra o expresión no encaja con cómo escribes en los ejemplos, no la uses.
+Tu objetivo es que cada respuesta suene EXACTAMENTE a ti (mismo tono, largo, vocabulario, puntuación y forma de saludar y despedirte) pero que sea una respuesta NUEVA, escrita para ese comentario.
 
 CÓMO ESCRIBES (sacado de {profile['examples_total']} respuestas tuyas reales):
 - Largo típico: {profile['median_words']} palabras (casi nunca más de {profile['p90_words']}).
@@ -67,14 +74,16 @@ CÓMO ESCRIBES (sacado de {profile['examples_total']} respuestas tuyas reales):
 - Cierres frecuentes: {join(profile['closers'])}.
 
 REGLAS:
-1. Responde en el mismo idioma del comentario, con tu estilo.
-2. No inventes datos, enlaces, fechas, precios, promesas ni anuncios de videos futuros.
-3. Si el comentario es de un miembro del canal ("tier": "miembro"), agradécele con cercanía, sin exagerar ni salirte de tu estilo.
-4. Pon "skip": true y "reply": "" si el comentario es spam, promoción, ofensivo, trata un tema delicado (salud, dinero, temas legales, una crisis personal), pregunta algo que solo tú podrías saber, o no tienes claro cómo lo responderías. Es mejor no responder que responder mal.
-5. Sin comillas, sin @menciones y sin hashtags. Una sola respuesta por comentario.
-6. Cada comentario trae "ejemplos_parecidos": respuestas tuyas reales a comentarios similares. Úsalas como guía principal de tono y palabras.
+1. NO copies tus respuestas anteriores. Los ejemplos son para aprender cómo escribes, no para repetirlos: cada respuesta debe reaccionar a algo concreto de lo que dice ESE comentario, con tus palabras y tu tono de siempre.
+2. No repitas la misma frase en respuestas a distintos comentarios del lote: cada persona recibe una respuesta propia.
+3. Responde en el mismo idioma del comentario.
+4. Nunca incluyas enlaces, @menciones ni hashtags. No pidas likes, suscripciones, membresías ni compras, y no ofrezcas nada a cambio.
+5. No inventes datos, fechas, precios, promesas ni anuncios de videos futuros.
+6. Si el comentario es de un miembro del canal ("tier": "miembro"), agradécele con cercanía, sin exagerar ni salirte de tu estilo.
+7. Pon "skip": true y "options": [] si el comentario es spam, promoción, ofensivo, trata un tema delicado (salud, dinero, temas legales, una crisis personal), pregunta algo que solo tú podrías saber, o no tienes claro cómo lo responderías. Es mejor no responder que responder mal.
+8. Cada comentario trae "ejemplos_parecidos": respuestas tuyas reales a comentarios similares. Úsalas como guía de tono y palabras, no como texto para copiar.
 
-Devuelve un objeto JSON con "replies": una entrada por cada comentario recibido, con su mismo "id".
+{options_rule} Devuelve un objeto JSON con "replies": una entrada por cada comentario recibido, con su mismo "id".
 
 TUS RESPUESTAS REALES:
 
@@ -85,9 +94,7 @@ TUS RESPUESTAS REALES:
 def clean_reply(text: str, profile: dict) -> str | None:
     reply = strip_mentions(text.strip().strip('"“”').strip())
     reply = re.sub(r"\n{3,}", "\n\n", reply)
-    if not reply:
-        return None
-    if URL_RE.search(reply) and profile.get("link_rate", 0) == 0:
+    if not reply or URL_RE.search(reply) or HASHTAG_RE.search(reply):
         return None
     limit = min(HARD_MAX_CHARS, max(300, profile.get("p90_chars", 0) * 3))
     if len(reply) > limit:
@@ -118,14 +125,15 @@ class Responder:
     model: str
     reasoning_effort: str = "none"
     service_tier: str = "flex"
+    variants: int = 2
     usage: Usage = field(default_factory=Usage)
 
     @classmethod
-    def from_env(cls, model: str, reasoning_effort: str, service_tier: str) -> "Responder":
+    def from_env(cls, model: str, reasoning_effort: str, service_tier: str, variants: int) -> "Responder":
         from openai import OpenAI
 
         # flex puede tardar más en responder; le damos margen.
-        return cls(OpenAI(timeout=900.0, max_retries=3), model, reasoning_effort, service_tier)
+        return cls(OpenAI(timeout=900.0, max_retries=3), model, reasoning_effort, service_tier, variants)
 
     def _request(self, instructions: str, payload: str, n_items: int):
         kwargs = {
@@ -135,7 +143,7 @@ class Responder:
             "text": {
                 "format": {"type": "json_schema", "name": "replies", "schema": REPLIES_SCHEMA, "strict": True}
             },
-            "max_output_tokens": TOKENS_PER_REPLY * n_items + 300,
+            "max_output_tokens": TOKENS_PER_OPTION * max(1, self.variants) * n_items + 300,
             "prompt_cache_key": "youtube-comment-agent",
             "store": False,
         }
@@ -154,9 +162,14 @@ class Responder:
             kwargs.pop("service_tier")
             return self.client.responses.create(**kwargs)
 
-    def generate(self, instructions: str, items: list[dict], profile: dict, batch_size: int = 10) -> dict[str, str]:
-        """Devuelve {id_del_comentario: respuesta}. Los comentarios omitidos no aparecen."""
-        results: dict[str, str] = {}
+    def generate(
+        self, instructions: str, items: list[dict], profile: dict, batch_size: int = 10
+    ) -> dict[str, list[str] | None]:
+        """Devuelve {id: [opciones limpias]}; None si el modelo decidió no responder.
+
+        Un id ausente significa que el modelo no devolvió nada útil para ese comentario.
+        """
+        results: dict[str, list[str] | None] = {}
         for start in range(0, len(items), max(1, batch_size)):
             batch = items[start : start + batch_size]
             payload = json.dumps({"comentarios": batch}, ensure_ascii=False)
@@ -169,9 +182,11 @@ class Responder:
                 continue
             wanted = {item["id"] for item in batch}
             for entry in data.get("replies", []):
-                if entry.get("id") not in wanted or entry.get("skip"):
+                if entry.get("id") not in wanted:
                     continue
-                reply = clean_reply(entry.get("reply", ""), profile)
-                if reply:
-                    results[entry["id"]] = reply
+                if entry.get("skip"):
+                    results[entry["id"]] = None
+                    continue
+                options = [clean_reply(o, profile) for o in entry.get("options", []) if isinstance(o, str)]
+                results[entry["id"]] = [o for o in options if o]
         return results
