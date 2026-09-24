@@ -1,0 +1,2 @@
+# Respaldo: solo se usa si la API de YouTube no deja leer la lista de miembros.
+# Un ID de canal por línea (empiezan por "UC"). Lo que va después de # se ignora.

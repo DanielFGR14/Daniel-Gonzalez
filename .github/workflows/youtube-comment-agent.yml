@@ -1,0 +1,81 @@
+name: Agente de comentarios de YouTube
+
+on:
+  schedule:
+    # 02:00 UTC = 9:00 p. m. en Colombia (UTC-5, sin horario de verano).
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      command:
+        description: "run = responder, train = volver a aprender tu estilo"
+        type: choice
+        options: [run, train]
+        default: run
+      dry_run:
+        description: "Simular sin publicar (default = usa la variable DRY_RUN del repo)"
+        type: choice
+        options: [default, "true", "false"]
+        default: default
+
+concurrency:
+  group: youtube-comment-agent
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: youtube-comment-agent
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: youtube-comment-agent/requirements.txt
+
+      - run: pip install -r requirements.txt
+
+      # El entrenamiento y el registro de respuestas publicadas se guardan entre ejecuciones.
+      - uses: actions/cache/restore@v4
+        with:
+          path: youtube-comment-agent/data
+          key: yt-agent-data-${{ github.run_id }}
+          restore-keys: yt-agent-data-
+
+      - name: Ejecutar agente
+        env:
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          # Mientras no crees la variable DRY_RUN=false, solo simula.
+          DRY_RUN: ${{ (inputs.dry_run == 'true' || inputs.dry_run == 'false') && inputs.dry_run || vars.DRY_RUN || 'true' }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
+          LOOKBACK_DAYS: ${{ vars.LOOKBACK_DAYS }}
+          MAX_MEMBER_REPLIES: ${{ vars.MAX_MEMBER_REPLIES }}
+          MAX_SUBSCRIBER_REPLIES: ${{ vars.MAX_SUBSCRIBER_REPLIES }}
+          MAX_REPLIES_PER_AUTHOR: ${{ vars.MAX_REPLIES_PER_AUTHOR }}
+          INCLUDE_NON_SUBSCRIBERS: ${{ vars.INCLUDE_NON_SUBSCRIBERS }}
+          TRAIN_BEFORE: ${{ vars.TRAIN_BEFORE }}
+        run: python -m agent ${{ inputs.command || 'run' }}
+
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: youtube-comment-agent/data
+          key: yt-agent-data-${{ github.run_id }}
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reporte-${{ github.run_id }}
+          path: youtube-comment-agent/data/reports/
+          retention-days: 7
+          if-no-files-found: ignore
