@@ -47,22 +47,26 @@ class Config:
     batch_size: int = 10
     variants: int = 2
 
-    # Qué responder
+    # Qué responder. YouTube puede tratar como spam muchas respuestas en poco tiempo,
+    # así que el total diario es moderado; lo que no alcance queda para la noche siguiente.
     dry_run: bool = True
     lookback_days: int = 3
-    max_member_replies: int = 50
-    max_subscriber_replies: int = 10
+    max_member_replies: int = 30
+    max_subscriber_replies: int = 5
     max_replies_per_author: int = 2
-    include_non_subscribers: bool = False
+    # Las suscripciones son privadas por defecto: la API casi nunca sabe quién está suscrito.
+    include_non_subscribers: bool = True
+    # IDs de canal ("UC...") o @handles de tus miembros, por si members.list no está disponible.
+    member_list: tuple[str, ...] = ()
 
     # Parecida a ti, pero nunca una copia
     max_similarity: float = 0.75
     min_style_score: float = 0.5
 
     # Ritmo humano: pausa aleatoria entre una respuesta y la siguiente
-    min_delay_seconds: int = 45
-    max_delay_seconds: int = 180
-    max_run_minutes: int = 120
+    min_delay_seconds: int = 30
+    max_delay_seconds: int = 120
+    max_run_minutes: int = 60
 
     # Entrenamiento
     examples_per_comment: int = 3
@@ -93,6 +97,7 @@ class Config:
             max_subscriber_replies=_int("MAX_SUBSCRIBER_REPLIES", cls.max_subscriber_replies),
             max_replies_per_author=_int("MAX_REPLIES_PER_AUTHOR", cls.max_replies_per_author),
             include_non_subscribers=_bool("INCLUDE_NON_SUBSCRIBERS", cls.include_non_subscribers),
+            member_list=tuple(_str("MEMBER_CHANNEL_IDS").replace(",", " ").split()),
             max_similarity=_float("MAX_SIMILARITY", cls.max_similarity),
             min_style_score=_float("MIN_STYLE_SCORE", cls.min_style_score),
             min_delay_seconds=_int("MIN_DELAY_SECONDS", cls.min_delay_seconds),

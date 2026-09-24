@@ -2,8 +2,9 @@ name: Agente de comentarios de YouTube
 
 on:
   schedule:
-    # 02:00 UTC = 9:00 p. m. en Colombia (UTC-5, sin horario de verano).
-    - cron: "0 2 * * *"
+    # 02:05 UTC = 9:05 p. m. en Colombia (UTC-5, sin horario de verano). Unos minutos después
+    # de la hora en punto porque GitHub avisa que a la hora exacta puede retrasar o descartar trabajos.
+    - cron: "5 2 * * *"
   workflow_dispatch:
     inputs:
       command:
@@ -27,8 +28,8 @@ permissions:
 jobs:
   agent:
     runs-on: ubuntu-latest
-    # Las pausas entre respuestas hacen que tarde hasta MAX_RUN_MINUTES (120 por defecto).
-    timeout-minutes: 150
+    # Las pausas entre respuestas hacen que tarde hasta MAX_RUN_MINUTES (60 por defecto).
+    timeout-minutes: 90
     defaults:
       run:
         working-directory: youtube-comment-agent
@@ -56,6 +57,8 @@ jobs:
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          # Lista de miembros (IDs "UC..." o @handles) como secreto, para que no quede pública.
+          MEMBER_CHANNEL_IDS: ${{ secrets.MEMBER_CHANNEL_IDS }}
           # Mientras no crees la variable DRY_RUN=false, solo simula.
           DRY_RUN: ${{ (inputs.dry_run == 'true' || inputs.dry_run == 'false') && inputs.dry_run || vars.DRY_RUN || 'true' }}
           OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}

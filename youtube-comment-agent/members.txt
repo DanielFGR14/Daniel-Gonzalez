@@ -1,2 +1,5 @@
-# Respaldo: solo se usa si la API de YouTube no deja leer la lista de miembros.
-# Un ID de canal por línea (empiezan por "UC"). Lo que va después de # se ignora.
+# Lista manual de miembros, por si members.list de YouTube no está disponible para tu canal.
+# Un miembro por línea: su ID de canal ("UC...") o su @handle. Lo que va después de " #" se ignora.
+#
+# OJO: si el repositorio es público, este archivo también lo es. En ese caso usa mejor el
+# secreto MEMBER_CHANNEL_IDS en GitHub (mismo formato, separado por comas o saltos de línea).

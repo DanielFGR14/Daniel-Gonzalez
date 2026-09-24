@@ -1,4 +1,5 @@
 import json
+import sys
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -8,7 +9,8 @@ from googleapiclient.errors import HttpError
 
 from agent.config import Config
 from agent.pipeline import (
-    MEMBER, OTHER, SUBSCRIBER, Store, needs_training, prune_posted, run, select_candidates, train,
+    MEMBER, OTHER, SUBSCRIBER, Store, manual_members, needs_training, prune_posted, run,
+    select_candidates, train, wipe_data,
 )
 from agent.quality import NoveltyChecker, choose, normalize, similarity
 from agent.responder import Responder, build_instructions, clean_reply
@@ -209,6 +211,8 @@ def test_responder_batches_and_respects_skip():
 
 def test_clean_reply_guards():
     profile = {"p90_chars": 40}
+    assert clean_reply("gracias 🙏🙏", profile) == "gracias 🙏🙏"
+    assert clean_reply("gracias 🙏🙏🙏🙏", profile) is None  # exceso de emojis
     assert clean_reply('"@fan Gracias!"', profile) == "Gracias!"
     assert clean_reply("mira https://x.com", profile) is None
     assert clean_reply("mira www.x.com", profile) is None
@@ -227,6 +231,7 @@ class FakeYouTube:
         self.units_used = 0
         self.posted = []
         self.fail_with = {}
+        self.hide = set()  # hilos donde YouTube "oculta" la respuesta (filtro de spam)
 
     def my_channel_id(self):
         return OWNER
@@ -239,6 +244,10 @@ class FakeYouTube:
 
     def fetch_thread(self, thread_id):
         return next((t for t in self.threads if t.id == thread_id), None)
+
+    def is_reply_visible(self, thread_id, reply_id):
+        t = self.fetch_thread(thread_id)
+        return t is None or any(r.id == reply_id for r in t.replies)
 
     def member_ids(self):
         return self.members
@@ -258,6 +267,8 @@ class FakeYouTube:
             content = json.dumps({"error": {"errors": [{"reason": reason}], "message": reason}}).encode()
             raise HttpError(httplib2.Response({"status": 403}), content)
         self.posted.append((parent_id, text))
+        if parent_id not in self.hide:
+            self.fetch_thread(parent_id).replies.append(c(f"r-{parent_id}", OWNER, text, hours_ago=0))
         return f"r-{parent_id}"
 
 
@@ -300,15 +311,15 @@ def test_run_trains_rejects_copies_and_never_repeats(tmp_path):
     # La opción "Descansa 🙏" es copia de una respuesta vieja: se publica la otra.
     assert yt.posted == [("n1", NEW_REPLIES["n1"])]
     assert summary["status"] == {"publicada": 1, "omitido por el modelo": 1}
-    assert (tmp_path / "reports" / "2026-09-25.md").exists()
+    assert (tmp_path / "reports" / "2026-09-24.md").exists()
     assert not (tmp_path / "data" / "reports").exists()
 
     # Segunda ejecución: no vuelve a responder el mismo hilo ni gasta tokens en el spam ya descartado.
     again = run(cfg, yt, Responder(FakeOpenAI(), "gpt-6-luna"), now=NOW, sleep=clock.sleep, clock=clock)
     assert again["status"] == {} and again["openai"]["calls"] == 0 and len(yt.posted) == 1
 
-    # Reentrenar no aprende de lo que publicó el agente.
-    yt.fetch_thread("n1").replies.append(c("r-n1", OWNER, yt.posted[0][1]))
+    # Reentrenar no aprende de lo que publicó el agente (su respuesta ya está en el hilo).
+    assert yt.fetch_thread("n1").replies[-1].id == "r-n1"
     assert train(cfg, yt, now=NOW)["examples_total"] == len(HISTORY)
 
 
@@ -322,9 +333,11 @@ def test_run_waits_random_time_between_posts_and_respects_time_budget(tmp_path):
     clock = FakeClock()
     summary = run(cfg, yt, Responder(FakeOpenAI(), "m"), now=NOW, sleep=clock.sleep, clock=clock)
 
-    assert len(clock.sleeps) == len(yt.posted) - 1  # sin espera antes de la primera
-    assert all(60 <= s <= 120 for s in clock.sleeps)
-    assert sum(clock.sleeps) <= 5 * 60
+    gaps, final_check = clock.sleeps[:-1], clock.sleeps[-1]
+    assert len(gaps) == len(yt.posted) - 1  # sin espera antes de la primera
+    assert all(60 <= s <= 120 for s in gaps)
+    assert sum(gaps) <= 5 * 60
+    assert final_check == 60  # espera corta antes de verificar la última
     assert summary["status"]["publicada"] == len(yt.posted) >= 3
     assert summary["status"].get("pendiente: se acabó el tiempo de hoy", 0) == 4 - len(yt.posted)
 
@@ -427,3 +440,64 @@ def test_rejected_comment_is_retried_at_most_twice(tmp_path):
         calls.append(responder.usage.calls)
     assert calls == [1, 1, 0]
     assert summary["status"] == {}
+
+
+def test_stops_for_the_night_when_youtube_hides_a_reply(tmp_path):
+    new = [thread(f"n{i}", c(f"n{i}c", f"UCm{i}", f"comentario {i}", hours_ago=10 - i)) for i in range(3)]
+    yt = FakeYouTube(history() + new, members={f"UCm{i}" for i in range(3)})
+    yt.hide = {"n0"}
+    cfg = replace(Config(), data_dir=tmp_path / "data", reports_dir=tmp_path / "r", dry_run=False)
+    summary = run(cfg, yt, Responder(FakeOpenAI(), "m"), now=NOW, sleep=FakeClock().sleep, clock=FakeClock())
+    assert [e["status"] for e in summary["entries"]] == [
+        "publicada, pero YouTube la ocultó (posible spam)",
+        "pendiente: YouTube ocultó la respuesta anterior; se detuvo por hoy",
+        "pendiente: YouTube ocultó la respuesta anterior; se detuvo por hoy",
+    ]
+    assert summary["hidden_by_youtube"] and len(yt.posted) == 1
+    assert "Atención" in (tmp_path / "r" / "2026-09-24.md").read_text()
+
+
+def test_manual_member_list_by_channel_id_or_handle(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEMBER_CHANNEL_IDS", "UCenv, @OtroFan\nUCenv2")
+    assert Config.from_env().member_list == ("UCenv", "@OtroFan", "UCenv2")
+
+    f = tmp_path / "members.txt"
+    f.write_text("# comentario\nUCfile  # alguien\n@FanDelArchivo\n", encoding="utf-8")
+    members = manual_members(replace(Config(), members_file=f, member_list=("UCenv", "@OtroFan")))
+    assert members == {"UCfile", "@fandelarchivo", "UCenv", "@otrofan"}
+
+    threads = [thread("a", c("1", "UCx", "hola", name="@OtroFan")), thread("b", c("2", "UCy", "hola"))]
+    picked = select_candidates(threads, OWNER, members, set(), set(), NOW - timedelta(days=3), 5, 5, 2, True)
+    assert [(p.thread.id, p.tier) for p in picked] == [("a", MEMBER), ("b", OTHER)]
+
+
+def test_wipe_data_keeps_only_the_live_date(tmp_path):
+    (tmp_path / "state.json").write_text('{"live_since": "2026-09-01T00:00:00+00:00"}')
+    (tmp_path / "training_pairs.json").write_text("[]")
+    (tmp_path / "posted.json").write_text("{}")
+    wipe_data(tmp_path)
+    assert sorted(p.name for p in tmp_path.rglob("*") if p.is_file()) == [".wiped", "state.json"]
+
+
+def test_main_wipes_data_when_youtube_token_is_revoked(tmp_path, monkeypatch):
+    from google.auth.exceptions import RefreshError
+
+    import agent.__main__ as cli
+
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "training_pairs.json").write_text("[]")
+    for name in ["YT_CLIENT_ID", "YT_CLIENT_SECRET", "YT_REFRESH_TOKEN"]:
+        monkeypatch.setenv(name, "x")
+    monkeypatch.setenv("DATA_DIR", str(data))
+
+    class Revoked:
+        units_used = 0
+
+        def my_channel_id(self):
+            raise RefreshError("invalid_grant: Token has been expired or revoked.")
+
+    monkeypatch.setattr(cli.YouTube, "from_env", classmethod(lambda cls, budget: Revoked()))
+    monkeypatch.setattr(sys, "argv", ["agent", "train"])
+    assert cli.main() == cli.EXIT_TOKEN_INVALID
+    assert not (data / "training_pairs.json").exists() and (data / ".wiped").exists()

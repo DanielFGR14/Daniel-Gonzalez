@@ -14,7 +14,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 
-from .style import URL_RE, strip_mentions
+from .style import EMOJI_RE, URL_RE, strip_mentions
 
 log = logging.getLogger(__name__)
 
@@ -95,6 +95,9 @@ def clean_reply(text: str, profile: dict) -> str | None:
     reply = strip_mentions(text.strip().strip('"“”').strip())
     reply = re.sub(r"\n{3,}", "\n\n", reply)
     if not reply or URL_RE.search(reply) or HASHTAG_RE.search(reply):
+        return None
+    # YouTube menciona el exceso de emojis como señal de spam.
+    if len(EMOJI_RE.findall(reply)) > max(3, profile.get("p90_emojis", 0)):
         return None
     limit = min(HARD_MAX_CHARS, max(300, profile.get("p90_chars", 0) * 3))
     if len(reply) > limit:

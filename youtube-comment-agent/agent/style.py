@@ -153,6 +153,7 @@ def build_profile(pairs: list[dict], canonical_count: int = 20) -> dict:
         "p90_words": _percentile(word_counts, 0.9) if word_counts else 0,
         "p90_chars": _percentile([len(r) for r in replies], 0.9) if replies else 0,
         "emoji_rate": _rate(replies, lambda r: bool(EMOJI_RE.search(r))),
+        "p90_emojis": _percentile([len(EMOJI_RE.findall(r)) for r in replies], 0.9) if replies else 0,
         "exclamation_rate": _rate(replies, lambda r: "!" in r),
         "question_rate": _rate(replies, lambda r: "?" in r),
         "capitalized_rate": _rate(replies, lambda r: r[:1].isupper()),

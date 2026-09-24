@@ -1,8 +1,9 @@
 # Agente de comentarios de YouTube
 
-Responde los comentarios de tu canal **como tú escribes**. Atiende primero a todos los
-**miembros del canal** y después a unos cuantos **suscriptores**. Se ejecuta solo todos los días a
-las **9:00 p. m. hora Colombia** con GitHub Actions.
+Responde los comentarios de tu canal **como tú escribes**, pero con respuestas nuevas, nunca
+copiadas. Atiende primero a los **miembros del canal** y después a unos cuantos comentarios de
+**suscriptores y otros espectadores**. Se ejecuta solo todos los días a las **9:05 p. m. hora
+Colombia** con GitHub Actions, y publica despacio, con pausas aleatorias.
 
 ## Cómo funciona
 
@@ -12,22 +13,73 @@ las **9:00 p. m. hora Colombia** con GitHub Actions.
    ~20 respuestas reales tuyas como ejemplo. No usa nada que no hayas escrito tú.
 2. **Respuesta diaria (`run`).**
    - Lee los comentarios de los últimos 3 días que aún no respondiste.
-   - Toma **todos los de miembros** (tope de 50) y luego **10 de suscriptores** (los que tienen más "me gusta").
-   - Para cada comentario busca, localmente, tus respuestas pasadas a comentarios parecidos.
-   - Le pide a `gpt-6-luna` las respuestas **en lotes de 10** y publica las que el modelo no descarta.
+   - Toma **primero a los miembros** (hasta 30 por noche, del comentario más viejo al más nuevo) y
+     luego **5 comentarios más** (los de suscriptores visibles primero, después los que tienen más "me gusta").
+   - Le pide a `gpt-6-luna` **2 opciones por comentario** en lotes de 10 y elige la mejor (ver abajo).
      Si un comentario es spam, delicado o algo que solo tú sabrías responder, el modelo lo **salta**.
-   - Nunca responde dos veces el mismo hilo, ni hilos donde ya respondiste tú.
-   - Nunca aprende de las respuestas que publicó el propio agente.
+   - **Publica despacio:** entre una respuesta y otra espera un tiempo al azar de **30 a 120 segundos**.
+     Como máximo publica durante 60 minutos; lo que no alcance queda para la noche siguiente.
+   - Justo antes de publicar revisa que el comentario siga existiendo y que no lo hayas respondido tú
+     mientras tanto.
+   - Después de publicar comprueba que YouTube **muestre** la respuesta. Si la oculta (señal de
+     posible spam), **se detiene esa noche** y la ejecución falla a propósito para que GitHub te avise por correo.
+
+### Parecida a ti, pero nunca una copia
+
+Tus respuestas pasadas **no se pegan**: sirven para que el modelo aprenda tu forma de escribir. Cada
+opción que propone pasa por dos filtros locales (sin gastar API):
+
+- **Novedad (obligatoria).** Se compara con todas tus respuestas reales, con lo que el agente publicó
+  en los últimos 30 días y con lo que ya eligió esa misma noche. Si se parece demasiado a alguna
+  (`MAX_SIMILARITY`, 0.75 por defecto), se descarta. Para comparar se ignoran mayúsculas, tildes,
+  signos y emojis: "Gracias!! 🙏" cuenta como copia de "gracias".
+- **Estilo.** Puntaje de 0 a 1 según si usa tu vocabulario, tu largo típico, tus emojis y qué tan
+  cerca queda de tu respuesta real más parecida sin copiarla. Por debajo de `MIN_STYLE_SCORE` (0.5) se descarta.
+
+Si las dos opciones fallan, ese comentario se reintenta la noche siguiente, como máximo dos veces en
+total. El reporte muestra para cada respuesta su **estilo** y su **parecido** con tu respuesta real más
+cercana, así puedes ajustar los límites.
 
 ### Uso mínimo de la API de OpenAI
 
-- El entrenamiento no gasta tokens: es estadística local.
+- El entrenamiento y los filtros no gastan tokens: son cálculos locales.
 - Una llamada cada 10 comentarios, con `reasoning: none` y `service_tier: flex` (mitad de precio;
   si flex falla, reintenta con el tier normal).
-- Las instrucciones (tu estilo + ejemplos) son idénticas en cada llamada, así que OpenAI las
-  cachea y las cobra a ~10%.
-- Con ~60 respuestas al día son ~6 llamadas: **centavos de dólar al mes**. Cada reporte muestra los
-  tokens usados.
+- Las instrucciones (tu estilo + ejemplos) son idénticas en cada llamada, así que OpenAI las cachea
+  y las cobra a ~10%.
+- Las 2 opciones van en la misma llamada: más texto de salida, pero ninguna llamada extra. Con
+  `VARIANTS_PER_COMMENT=1` gasta aún menos.
+- Nunca vuelve a enviar un comentario que el modelo ya decidió no responder.
+- Con ~35 respuestas al día son ~4 llamadas: **centavos de dólar al mes**. Cada reporte muestra los tokens usados.
+
+## Qué permite YouTube y qué no
+
+Resumen de las reglas que aplican a este agente, y qué hace el agente con cada una.
+
+| Regla de YouTube / Google | Qué hace el agente |
+|---|---|
+| **Consentimiento y control final.** Las políticas de la API piden que el usuario haya dado su consentimiento *previo, específico y expreso* antes de automatizar comentarios, y que tenga *el control final* de lo que se publica. | Arranca en **modo simulación**. Solo publica cuando tú mismo creas `DRY_RUN=false`. Cada noche deja un reporte con todo lo publicado y lo puedes apagar cuando quieras. La lectura más estricta de "control final" sería aprobar cada respuesta antes de publicarla; hoy el agente no tiene ese paso. |
+| **Spam en comentarios.** Prohibido dejar muchos comentarios idénticos, no dirigidos o repetitivos. YouTube avisa que publicar mucho en poco tiempo, repetir el mismo comentario, poner enlaces o abusar de los emojis puede marcarse como spam. | Cada respuesta es única y responde a ese comentario. Nunca pone enlaces ni hashtags, y descarta respuestas con exceso de emojis (más de 3, salvo que tú uses más). Hace pausas al azar, tiene un tope diario moderado (35) y **se detiene si YouTube oculta una respuesta**. |
+| **Interacción falsa e incentivos.** Prohibido inflar métricas con sistemas automáticos y ofrecer recompensas por comentar o suscribirse. Invitar a suscribirse sí está permitido. | El modelo tiene prohibido pedir likes, suscripciones o compras y ofrecer algo a cambio. Solo responde comentarios reales de tu propio canal. |
+| **Datos de la API: máximo 30 días.** Lo guardado (textos de comentarios, IDs) se debe borrar o refrescar a los 30 días. Si revocas el acceso o el token ya no se puede renovar, hay que borrar los datos. | Reentrena cada 25 días, lo que refresca los datos y hace desaparecer lo que se borró en YouTube. Borra los registros de más de 30 días. Los reportes duran 7 días. Si el token deja de servir, **borra los datos** (GitHub elimina solas las copias viejas de la caché a los 7 días sin uso). |
+| **Cuota diaria.** 10.000 unidades gratis al día; cada respuesta publicada cuesta 50. | Se frena solo en 9.000 y se detiene ante errores de cuota o de permisos. |
+| **Lista de miembros (`members.list`).** Solo está disponible para creadores a quienes Google les dio acceso. | Si YouTube no la entrega, usa tu lista manual del secreto `MEMBER_CHANNEL_IDS`. |
+| **Suscriptores.** Las suscripciones son **privadas por defecto**, así que la API solo ve a quienes las tienen públicas. | Los suscriptores visibles van primero; los cupos restantes se llenan con otros comentaristas (`INCLUDE_NON_SUBSCRIBERS`). |
+| **IA en comentarios.** La etiqueta obligatoria de contenido alterado o sintético aplica a videos realistas. No encontré ninguna regla que obligue a avisar en comentarios. YouTube mismo ofrece respuestas sugeridas por IA "con tu propio tono". | Nada especial. |
+| **Uso automatizado.** Los Términos de YouTube prohíben entrar al servicio con robots o scrapers. La vía autorizada para automatizar es la API oficial. | Solo usa la YouTube Data API oficial, con tu propia autorización OAuth. |
+
+Fuentes: [Políticas para desarrolladores de la API](https://developers.google.com/youtube/terms/developer-policies),
+[Política de spam](https://support.google.com/youtube/answer/2801973),
+[Interacción falsa](https://support.google.com/youtube/answer/3399767),
+[Comentarios detectados como spam](https://support.google.com/youtube/answer/13209064),
+[Costo de cuota](https://developers.google.com/youtube/v3/determine_quota_cost),
+[members.list](https://developers.google.com/youtube/v3/docs/members/list),
+[Privacidad de suscripciones](https://support.google.com/youtube/answer/7280190),
+[Contenido alterado o sintético](https://support.google.com/youtube/answer/14328491),
+[Términos de YouTube](https://www.youtube.com/t/terms),
+[OAuth 2.0 de Google](https://developers.google.com/identity/protocols/oauth2).
+Varias de estas páginas no se pudieron abrir directamente al investigarlas, así que su contenido se
+tomó de extractos de búsqueda. Si alguna regla es crítica para ti, revísala en la fuente.
 
 ## Configuración (una sola vez)
 
@@ -47,13 +99,21 @@ las **9:00 p. m. hora Colombia** con GitHub Actions.
    python get_refresh_token.py client_secret.json
    ```
    Entra con la cuenta del canal (si tienes varios, elige el correcto). Imprime
-   `YT_CLIENT_ID`, `YT_CLIENT_SECRET` y `YT_REFRESH_TOKEN`.
+   `YT_CLIENT_ID`, `YT_CLIENT_SECRET` y `YT_REFRESH_TOKEN`. Si Google te dio acceso a la lista de
+   miembros por API, agrega `--members`.
 
 ### 2. Clave de OpenAI
 
 Crea una API key en <https://platform.openai.com/api-keys>.
 
-### 3. Secretos en GitHub
+### 3. Tu lista de miembros
+
+Como `members.list` casi nunca está disponible, dale al agente la lista tú mismo: el **ID de canal**
+(`UC...`) o el **@handle** de cada miembro, separados por comas o saltos de línea. El ID aparece en
+el canal de cada persona, en *Acerca de → Compartir canal → Copiar ID del canal*. Actualízala cuando
+entren o salgan miembros.
+
+### 4. Secretos en GitHub
 
 En el repo: **Settings → Secrets and variables → Actions → New repository secret**:
 
@@ -63,21 +123,23 @@ En el repo: **Settings → Secrets and variables → Actions → New repository 
 | `YT_CLIENT_SECRET` | del paso 1 |
 | `YT_REFRESH_TOKEN` | del paso 1 |
 | `OPENAI_API_KEY` | del paso 2 |
+| `MEMBER_CHANNEL_IDS` | del paso 3 (va como secreto para que la lista no quede pública) |
 
-### 4. Primera prueba (modo simulación)
+### 5. Primera prueba (modo simulación)
 
 El agente arranca en **modo simulación**: genera las respuestas pero **no publica nada**.
 
 1. **Actions → Agente de comentarios de YouTube → Run workflow** con `command = train`.
 2. Luego otra vez con `command = run`.
-3. Descarga el artefacto `reporte-…`: trae cada comentario con la respuesta que habría publicado.
+3. Descarga el artefacto `reporte-…`: trae cada comentario con la respuesta que habría publicado,
+   su puntaje de estilo y su parecido con tu respuesta real más cercana.
 
-### 5. Activarlo de verdad
+### 6. Activarlo de verdad
 
 Cuando te gusten las respuestas: **Settings → Secrets and variables → Actions → Variables →
 New repository variable**:
 
-- `DRY_RUN` = `false`. Desde esa noche publica solo a las 9 p. m.
+- `DRY_RUN` = `false`. Desde esa noche publica solo.
 - `TRAIN_BEFORE` = la fecha de hoy (ej. `2026-09-24`). Es una protección extra para que, si algún
   día se reentrena, nunca aprenda de respuestas escritas por el agente.
 
@@ -87,29 +149,32 @@ New repository variable**:
 |---|---|---|
 | `DRY_RUN` | `true` | `false` para publicar de verdad |
 | `OPENAI_MODEL` | `gpt-6-luna` | Modelo de OpenAI |
+| `VARIANTS_PER_COMMENT` | `2` | Opciones que el modelo propone por comentario |
+| `MAX_SIMILARITY` | `0.75` | Parecido máximo con cualquier respuesta existente (1 = copia exacta) |
+| `MIN_STYLE_SCORE` | `0.5` | Puntaje de estilo mínimo para publicar |
+| `MIN_DELAY_SECONDS` / `MAX_DELAY_SECONDS` | `30` / `120` | Pausa al azar entre respuestas |
+| `MAX_RUN_MINUTES` | `60` | Tiempo máximo publicando cada noche (si lo subes de 80, sube también `timeout-minutes` en el workflow) |
 | `LOOKBACK_DAYS` | `3` | Cuántos días hacia atrás buscar comentarios sin responder |
-| `MAX_MEMBER_REPLIES` | `50` | Tope diario de respuestas a miembros |
-| `MAX_SUBSCRIBER_REPLIES` | `10` | Respuestas diarias a suscriptores |
-| `MAX_REPLIES_PER_AUTHOR` | `2` | Máximo de respuestas por persona y día |
-| `INCLUDE_NON_SUBSCRIBERS` | `false` | Completar los cupos de suscriptores con otros comentaristas |
-| `TRAIN_BEFORE` | — | Fecha ISO (ej. `2026-09-24`); solo aprende de respuestas anteriores a ella |
-
-Para que aprenda de tus respuestas nuevas, corre `train` a mano cuando quieras.
+| `MAX_MEMBER_REPLIES` | `30` | Tope por noche de respuestas a miembros |
+| `MAX_SUBSCRIBER_REPLIES` | `5` | Respuestas por noche a no miembros |
+| `MAX_REPLIES_PER_AUTHOR` | `2` | Máximo de respuestas por persona y noche |
+| `INCLUDE_NON_SUBSCRIBERS` | `true` | Completar los cupos de no miembros con comentaristas cuya suscripción no se ve |
+| `TRAIN_BEFORE` | — | Fecha ISO; solo aprende de respuestas anteriores a ella |
 
 ## Limitaciones que debes conocer
 
-- **Suscriptores:** YouTube solo deja ver a los suscriptores que tienen sus suscripciones
-  **públicas**. Si el agente encuentra pocos, activa `INCLUDE_NON_SUBSCRIBERS=true`.
-- **Miembros:** se leen con la API de membresías. Si tu canal no la tiene disponible, pon los IDs de
-  canal de tus miembros en `members.txt`.
-- **Cuota de YouTube:** 10.000 unidades diarias gratis. Leer es barato; **cada respuesta publicada
-  cuesta 50**. El agente se frena solo en 9.000.
-- **Horario:** GitHub puede retrasar unos minutos los trabajos programados. Además, en repositorios
+- **Aprende de tus respuestas anteriores a la activación.** Una vez que el agente empieza a
+  publicar, deja de aprender de respuestas nuevas del canal (incluidas las que escribas tú a mano),
+  para no aprender nunca de sí mismo.
+- **Minutos de GitHub Actions:** en un repo público son gratis. En uno privado con el plan Free hay
+  2.000 minutos al mes; con los valores por defecto el agente usa como mucho unos 60 minutos por noche.
+- **Horario:** GitHub puede retrasar los trabajos programados en horas de mucha carga. En repositorios
   públicos desactiva la programación tras 60 días sin actividad en el repo; en ese caso se reactiva
   desde la pestaña Actions.
-- **Privacidad:** en un repo público los logs de Actions son públicos. El agente solo escribe totales
-  en los logs; el detalle va en el artefacto del reporte, que se borra a los 7 días. Aun así, conviene
-  que el repositorio sea privado.
+- **Privacidad:** el texto de los comentarios se envía a OpenAI para generar las respuestas (con
+  `store=false`). En un repo público los logs de Actions son públicos: el agente solo escribe totales
+  en los logs, y el detalle va en el artefacto del reporte, que se borra a los 7 días. Aun así,
+  conviene que el repositorio sea privado.
 
 ## Desarrollo
 

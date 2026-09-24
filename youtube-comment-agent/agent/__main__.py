@@ -12,9 +12,14 @@ import logging
 import os
 import sys
 
+from google.auth.exceptions import RefreshError
+
 from .config import Config
-from .pipeline import run, train
+from .pipeline import run, train, wipe_data
 from .youtube import QuotaExceeded, YouTube
+
+EXIT_TOKEN_INVALID = 3
+EXIT_HIDDEN_BY_YOUTUBE = 4
 
 
 def main() -> int:
@@ -47,6 +52,15 @@ def main() -> int:
     except QuotaExceeded as err:
         print(f"Cuota de YouTube agotada por hoy: {err}", file=sys.stderr)
         return 1
+    except RefreshError as err:
+        # Las políticas de YouTube piden borrar los datos si el token se revoca o ya no se puede renovar.
+        wipe_data(cfg.data_dir)
+        print(
+            f"El token de YouTube ya no sirve ({err}). Borré los datos guardados del canal. "
+            "Genera un YT_REFRESH_TOKEN nuevo con get_refresh_token.py (ver README).",
+            file=sys.stderr,
+        )
+        return EXIT_TOKEN_INVALID
 
     # En los logs solo van totales; el detalle (comentarios y respuestas) queda en reports/.
     totals = {k: v for k, v in summary.items() if k != "entries"}
@@ -55,6 +69,10 @@ def main() -> int:
     if step_summary:
         with open(step_summary, "a", encoding="utf-8") as fh:
             fh.write("## Agente de comentarios\n\n```json\n" + json.dumps(totals, ensure_ascii=False, indent=2) + "\n```\n")
+    if summary.get("hidden_by_youtube"):
+        # Falla a propósito para que GitHub te avise por correo.
+        print("YouTube ocultó una respuesta como posible spam; el agente se detuvo. Revisa el reporte.", file=sys.stderr)
+        return EXIT_HIDDEN_BY_YOUTUBE
     return 0
 
 

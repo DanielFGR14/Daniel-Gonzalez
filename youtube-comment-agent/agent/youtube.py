@@ -185,7 +185,11 @@ class YouTube:
         return thread
 
     def member_ids(self) -> set[str] | None:
-        """IDs de canal de los miembros actuales. None si la API no lo permite."""
+        """IDs de canal de los miembros actuales. None si la API no lo permite.
+
+        YouTube solo habilita members.list a los creadores a quienes Google les dio acceso;
+        para el resto responde 403 y se usa la lista manual (MEMBER_CHANNEL_IDS).
+        """
         from googleapiclient.errors import HttpError
 
         ids: set[str] = set()
@@ -195,7 +199,8 @@ class YouTube:
                 resp = self._execute(
                     self.api.members().list(
                         part="snippet", mode="all_current", maxResults=1000, pageToken=page_token
-                    )
+                    ),
+                    cost=2,
                 )
                 for item in resp.get("items", []):
                     member_id = item["snippet"].get("memberDetails", {}).get("channelId")
@@ -241,6 +246,12 @@ class YouTube:
             for item in resp.get("items", []):
                 titles[item["id"]] = item["snippet"].get("title", "")
         return titles
+
+    def is_reply_visible(self, thread_id: str, reply_id: str) -> bool:
+        """¿Tu respuesta aparece publicada en el hilo? Si YouTube la retiene como posible spam, no aparece."""
+        thread = self.fetch_thread(thread_id)
+        # Si borraron el comentario original, tu respuesta se fue con él: no es señal de spam.
+        return thread is None or any(r.id == reply_id for r in thread.replies)
 
     # -- escritura -------------------------------------------------------------
 

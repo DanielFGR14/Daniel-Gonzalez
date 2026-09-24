@@ -10,6 +10,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from googleapiclient.errors import HttpError
 
@@ -25,8 +26,14 @@ MEMBER = "miembro"
 SUBSCRIBER = "suscriptor"
 OTHER = "otro"
 
-# Si YouTube responde con alguno de estos errores, se deja de publicar por hoy.
-STOP_REASONS = {"quotaExceeded", "rateLimitExceeded", "userRateLimitExceeded", "dailyLimitExceeded"}
+LOCAL_TZ = ZoneInfo("America/Bogota")
+
+# Si YouTube responde con alguno de estos errores, se deja de publicar por hoy: son problemas
+# de la cuenta o de límites, no de un comentario en particular.
+STOP_REASONS = {
+    "quotaExceeded", "rateLimitExceeded", "userRateLimitExceeded", "dailyLimitExceeded",
+    "forbidden", "insufficientPermissions", "ineligibleAccount", "authError", "401",
+}
 
 # Un comentario cuyas opciones fueron descartadas se reintenta, como mucho, estas veces en total.
 MAX_ATTEMPTS = 2
@@ -72,8 +79,30 @@ class Store:
 def load_member_file(path: Path) -> set[str]:
     if not path.exists():
         return set()
-    lines = (line.split("#", 1)[0].strip() for line in path.read_text(encoding="utf-8").splitlines())
-    return {line for line in lines if line}
+    # Lo que va después de " #" es comentario (sin tocar los @handles).
+    lines = (line.split(" #", 1)[0].strip() for line in path.read_text(encoding="utf-8").splitlines())
+    return {line for line in lines if line and not line.startswith("#")}
+
+
+def manual_members(cfg: Config) -> set[str]:
+    """IDs de canal tal cual y @handles en minúscula, de MEMBER_CHANNEL_IDS y del archivo."""
+    entries = set(cfg.member_list) | load_member_file(cfg.members_file)
+    return {e.lower() if e.startswith("@") else e for e in entries}
+
+
+def wipe_data(data_dir: Path) -> None:
+    """Borra todo lo guardado de YouTube (lo exigen sus políticas si el token deja de servir).
+
+    Se conserva state.json (solo guarda la fecha en que el agente empezó a publicar, para no
+    aprender nunca de sus propias respuestas) y se deja una marca para que la caché de GitHub
+    guarde esta versión vacía; las copias viejas se borran solas a los 7 días sin uso.
+    """
+    if data_dir.exists():
+        for path in data_dir.rglob("*"):
+            if path.is_file() and path.name != "state.json":
+                path.unlink()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / ".wiped").write_text(datetime.now(timezone.utc).isoformat(), encoding="utf-8")
 
 
 def prune_posted(posted: dict, now: datetime, retention_days: int, key: str = "posted_at") -> dict:
@@ -179,7 +208,8 @@ def select_candidates(
             or any(r.author_channel_id == owner_id for r in thread.replies)
         ):
             continue
-        tier = MEMBER if author in members else SUBSCRIBER if author in subscribers else OTHER
+        is_member = author in members or thread.top.author_name.lower() in members
+        tier = MEMBER if is_member else SUBSCRIBER if author in subscribers else OTHER
         by_tier[tier].append(thread)
 
     # Miembros: del más viejo al más nuevo, para que ninguno se quede sin respuesta.
@@ -247,10 +277,15 @@ def run(
     if not cfg.dry_run and not cfg.train_before:
         log.warning("Modo en vivo sin TRAIN_BEFORE: defínela para blindar el entrenamiento (ver README).")
 
-    members = yt.member_ids()
-    if members is None:
-        members = load_member_file(cfg.members_file)
-        log.info("Uso la lista de miembros de %s (%d canales).", cfg.members_file, len(members))
+    members = manual_members(cfg)
+    api_members = yt.member_ids()
+    if api_members is not None:
+        members |= api_members
+    elif not members:
+        log.warning(
+            "No tengo lista de miembros: YouTube no dio acceso a members.list y MEMBER_CHANNEL_IDS "
+            "está vacía. Todos los comentarios se tratarán como de no miembros (ver README)."
+        )
     subscribers = yt.public_subscriber_ids() if cfg.max_subscriber_replies > 0 else set()
 
     since = now - timedelta(days=cfg.lookback_days)
@@ -268,11 +303,13 @@ def run(
         cfg.include_non_subscribers,
     )
     summary = {
-        "date": now.date().isoformat(),
+        # Fecha de Colombia: a las 9 p. m. allá, en UTC ya es el día siguiente.
+        "date": now.astimezone(LOCAL_TZ).date().isoformat(),
         "dry_run": cfg.dry_run,
         "threads_checked": len(threads),
         "candidates": dict(Counter(c.tier for c in candidates)),
         "status": Counter(),
+        "hidden_by_youtube": False,
         "entries": [],
     }
     if not candidates:
@@ -330,21 +367,32 @@ def run(
     # 3. Publicar despacio, con pausas aleatorias entre respuestas.
     state = store.state()
     started = clock()
-    posted_now = 0
+    posted_any = False
+    unverified = None  # la última publicada, hasta confirmar que YouTube la muestra
+
+    def stop(from_position: int, reason: str) -> None:
+        for _, pending in queue[from_position:]:
+            pending["status"] = f"pendiente: {reason}"
+
     for position, (cand, entry) in enumerate(queue):
         if cfg.dry_run:
             entry["status"] = "simulada (no publicada)"
             continue
-        if posted_now:
+        if posted_any:
             delay = rng.uniform(cfg.min_delay_seconds, cfg.max_delay_seconds)
             if clock() - started + delay > cfg.max_run_minutes * 60:
-                for _, pending in queue[position:]:
-                    pending["status"] = "pendiente: se acabó el tiempo de hoy"
+                stop(position, "se acabó el tiempo de hoy")
                 break
             sleep(delay)
-        if not yt.can_spend(WRITE_COST + 2):
-            for _, pending in queue[position:]:
-                pending["status"] = "pendiente: sin cuota de YouTube hoy"
+            # Si YouTube ocultó la respuesta anterior (su señal de posible spam), se para por hoy.
+            if unverified and not _confirm_visible(yt, unverified, sleep, cfg.min_delay_seconds):
+                summary["hidden_by_youtube"] = True
+                stop(position, "YouTube ocultó la respuesta anterior; se detuvo por hoy")
+                unverified = None
+                break
+            unverified = None
+        if not yt.can_spend(WRITE_COST + 6):
+            stop(position, "sin cuota de YouTube hoy")
             break
 
         try:
@@ -369,15 +417,36 @@ def run(
             entry["status"] = f"error de YouTube: {reason}"
             if reason in STOP_REASONS:
                 log.warning("YouTube respondió %s; dejo de publicar por hoy.", reason)
-                for _, pending in queue[position + 1 :]:
-                    pending["status"] = f"pendiente: YouTube respondió {reason}"
+                stop(position + 1, f"YouTube respondió {reason}")
                 break
             continue
         posted[cand.thread.id] = {"reply_id": reply_id, "posted_at": now.isoformat(), "text": entry["reply"]}
         _save_json(store.posted_path, posted)
         entry["status"] = "publicada"
-        posted_now += 1
+        posted_any = True
+        unverified = (cand.thread.id, reply_id, entry)
+
+    if unverified:  # verificar también la última
+        sleep(cfg.min_delay_seconds)
+        if not _confirm_visible(yt, unverified, sleep, cfg.min_delay_seconds):
+            summary["hidden_by_youtube"] = True
     return _finish(cfg, summary, yt, responder)
+
+
+def _confirm_visible(yt, published: tuple, sleep, wait: float) -> bool:
+    """True si la respuesta aparece en el hilo (con un reintento, por si YouTube tarda en mostrarla)."""
+    thread_id, reply_id, entry = published
+    try:
+        for attempt in range(2):
+            if yt.is_reply_visible(thread_id, reply_id):
+                return True
+            if attempt == 0:
+                sleep(wait)
+    except (HttpError, QuotaExceeded):
+        return True  # no se pudo comprobar; eso no es una señal de spam
+    entry["status"] = "publicada, pero YouTube la ocultó (posible spam)"
+    log.warning("YouTube no muestra la respuesta %s: posible filtro de spam.", reply_id)
+    return False
 
 
 def _finish(cfg: Config, summary: dict, yt, responder) -> dict:
@@ -401,6 +470,14 @@ def _write_markdown_report(path: Path, summary: dict) -> None:
     lines = [
         f"# Respuestas del {summary['date']} — {mode}",
         "",
+    ]
+    if summary.get("hidden_by_youtube"):
+        lines += [
+            "> **Atención:** YouTube ocultó una respuesta (posible filtro de spam) y el agente se detuvo. "
+            "Considera bajar MAX_MEMBER_REPLIES o subir las pausas.",
+            "",
+        ]
+    lines += [
         f"- Hilos revisados: {summary['threads_checked']}",
         f"- Seleccionados: {summary['candidates']}",
         f"- Resultado: {summary['status']}",
